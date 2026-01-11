@@ -2,8 +2,6 @@
 import os
 from pathlib import Path
 from typing import Dict, Any
-from win import evaluate_country_win_conditions, evaluate_all_countries
-
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -30,8 +28,18 @@ from db import (
     all_locked,
     apply_country_deltas,
     insert_turn_history,
+    get_recent_round_summaries,
+    upsert_round_summary,
+    clear_all_round_summaries,
 )
-from ai_round import generate_actions_for_country, resolve_round_all_countries
+from ai_round import generate_actions_for_country, resolve_round_all_countries, generate_round_summary
+
+# Optional: wenn du win.py bereits nutzt
+try:
+    from win import evaluate_all_countries, evaluate_country_win_conditions
+except Exception:
+    evaluate_all_countries = None
+    evaluate_country_win_conditions = None
 
 
 def load_env():
@@ -115,7 +123,6 @@ if not api_key:
     st.error("MISTRAL_API_KEY fehlt. Lege eine .env neben app.py an: MISTRAL_API_KEY=... ")
     st.stop()
 
-# Optional GM "Auth" via env
 gm_pin = (os.getenv("GM_PIN") or "").strip()
 
 conn = get_conn()
@@ -160,6 +167,7 @@ colA, colB = st.sidebar.columns(2)
 if colB.button("💣 Reset alle"):
     reset_all_countries(conn, COUNTRY_DEFS)
     clear_round_data(conn, round_no)
+    clear_all_round_summaries(conn)
     set_eu_state(conn, EU_DEFAULT["cohesion"], EU_DEFAULT["global_context"])
     set_game_meta(conn, 1, "setup")
     st.rerun()
@@ -176,7 +184,6 @@ with right:
     locks = get_locks(conn, round_no)
 
     st.write("**Lock-Status (diese Runde)**")
-    # Spieler dürfen sehen WER gelockt hat – aber NICHT welche Variante (außer GM)
     for c in countries:
         name = countries_display[c]
         if c in locks:
@@ -193,36 +200,49 @@ with right:
     st.caption(eu["global_context"])
 
     st.write("---")
-        # --- Win-Status (alle sehen: ob jemand gewonnen hat; Details pro Land zeigen wir in Player-Panel)
-    all_metrics_now = load_all_country_metrics(conn, countries)
-    eu_now = get_eu_state(conn)  # frische EU-Werte aus DB
-    win_eval = evaluate_all_countries(
-        all_country_metrics=all_metrics_now,
-        eu_state=eu_now,
-        country_defs=COUNTRY_DEFS,
-    )
 
-    winners = [countries_display[c] for c in countries if win_eval.get(c, {}).get("is_winner")]
-    if winners:
-        st.success("🏆 Gewinner erreicht: " + ", ".join(winners))
-    else:
-        st.caption("Noch kein Land hat die Siegbedingungen vollständig erfüllt.")
+    # Memory anzeigen (für alle ok, enthält keine geheimen Varianten)
+    with st.expander("🧠 Letzte Runden (Memory)"):
+        mem = get_recent_round_summaries(conn, limit=5)
+        if not mem:
+            st.write("Noch keine Runden-Summaries vorhanden.")
+        else:
+            for r, s in reversed(mem):
+                st.markdown(f"**Runde {r}**\n\n{s}")
+
     st.write("---")
-     # --- GM Detail: Siegfortschritt aller Länder
-    with st.expander("📈 Siegfortschritt (GM Detail)"):
-        for c in countries:
-            st.markdown(f"### {countries_display[c]}")
-            res = win_eval[c]["results"]
-            if not res:
-                st.caption("Keine Bedingungen definiert.")
-                continue
-            for r in res:
-                st.write(
-                    ("✅ " if r.ok else "❌ ")
-                    + f"{r.label} (aktuell: {r.current})"
-                )
-            st.write("---")
-    # GM controls below (only GM sees them)
+
+    # Optional: Winners overview (falls win.py da ist)
+    if evaluate_all_countries is not None:
+        all_metrics_now = load_all_country_metrics(conn, countries)
+        eu_now = get_eu_state(conn)
+        win_eval = evaluate_all_countries(
+            all_country_metrics=all_metrics_now,
+            eu_state=eu_now,
+            country_defs=COUNTRY_DEFS,
+        )
+
+        winners = [countries_display[c] for c in countries if win_eval.get(c, {}).get("is_winner")]
+        if winners:
+            st.success("🏆 Gewinner erreicht: " + ", ".join(winners))
+        else:
+            st.caption("Noch kein Land hat die Siegbedingungen vollständig erfüllt.")
+
+        # GM Detail
+        if is_gm:
+            with st.expander("📈 Siegfortschritt (GM Detail)"):
+                for c in countries:
+                    st.markdown(f"### {countries_display[c]}")
+                    res = win_eval[c]["results"]
+                    if not res:
+                        st.caption("Keine Bedingungen definiert.")
+                        continue
+                    for r in res:
+                        st.write(("✅ " if r.ok else "❌ ") + f"{r.label} (aktuell: {r.current})")
+
+        st.write("---")
+
+    # GM controls below
     if not is_gm:
         st.info("Für Rundensteuerung: in der Sidebar zu **Game Master** wechseln.")
     else:
@@ -232,7 +252,7 @@ with right:
         have_all_actions = all((c in actions_in_db and len(actions_in_db[c]) == 3) for c in countries)
         have_all_locks = all_locked(conn, round_no, countries)
 
-        # Generate allowed until published
+        # Generate: erlaubt bis veröffentlicht (setup + actions_generated)
         gen_disabled = (phase == "actions_published")
         if st.button("⚙️ Aktionen für alle generieren", disabled=gen_disabled, use_container_width=True):
             with st.spinner("Generiere Aktionen für alle Länder..."):
@@ -275,36 +295,55 @@ with right:
                     st.write(f"**Passiv:** {a.get('passiv','')}")
                     st.write("---")
 
+        # Publish: nur wenn actions_generated + alles da
         publish_disabled = not (phase == "actions_generated" and have_all_actions)
         if st.button("🚦 Runde starten (Optionen veröffentlichen)", disabled=publish_disabled, use_container_width=True):
             set_game_meta(conn, round_no, "actions_published")
             st.rerun()
 
+        # Resolve: nur wenn published + alle gelockt
         resolve_disabled = not (phase == "actions_published" and have_all_locks)
         if st.button("🧮 Ergebnis der Runde kalkulieren", disabled=resolve_disabled, use_container_width=True):
             with st.spinner("KI kalkuliert Gesamtergebnis der Runde..."):
+                # Stufe 1 Memory: letzte 3 Summaries
+                recent_summaries = get_recent_round_summaries(conn, limit=3)
+
                 actions_texts = get_round_actions(conn, round_no)
                 locks_now = get_locks(conn, round_no)
                 all_metrics = load_all_country_metrics(conn, countries)
+
+                # chosen actions string (für summary + KI)
+                chosen_actions_lines = []
+                for c in countries:
+                    v = locks_now[c]
+                    chosen_actions_lines.append(
+                        f"- {countries_display[c]} ({c}): {v} -> {actions_texts[c][v]}"
+                    )
+                chosen_actions_str = "\n".join(chosen_actions_lines)
+
+                eu_before = get_eu_state(conn)
 
                 result = resolve_round_all_countries(
                     api_key=api_key,
                     model="mistral-small",
                     round_no=round_no,
-                    eu_state=eu,
+                    eu_state=eu_before,
                     countries_metrics=all_metrics,
                     countries_display=countries_display,
                     actions_texts=actions_texts,
                     locked_choices=locks_now,
+                    recent_round_summaries=recent_summaries,  # ✅ Stufe 1
                     temperature=0.6,
                     top_p=0.95,
-                    max_tokens=1400,
+                    max_tokens=1500,
                 )
 
+                # Apply EU
                 eu_delta = int(result["eu"].get("kohäsion_delta", 0))
-                new_global = str(result["eu"].get("global_context", eu["global_context"]))
-                set_eu_state(conn, eu["cohesion"] + eu_delta, new_global)
+                new_global = str(result["eu"].get("global_context", eu_before["global_context"]))
+                set_eu_state(conn, eu_before["cohesion"] + eu_delta, new_global)
 
+                # Apply countries + history
                 for c in countries:
                     d = result["länder"][c] or {}
                     apply_country_deltas(conn, c, d)
@@ -320,6 +359,25 @@ with right:
                         deltas=d,
                     )
 
+                eu_after = get_eu_state(conn)
+
+                # Stufe 2 Summary schreiben + speichern
+                summary_text = generate_round_summary(
+                    api_key=api_key,
+                    model="mistral-small",
+                    round_no=round_no,
+                    memory_in=recent_summaries,
+                    eu_before=eu_before,
+                    eu_after=eu_after,
+                    chosen_actions_str=chosen_actions_str,
+                    result_obj=result,
+                    temperature=0.4,
+                    top_p=0.95,
+                    max_tokens=500,
+                )
+                upsert_round_summary(conn, round_no, summary_text)
+
+                # Next round
                 clear_round_data(conn, round_no)
                 set_game_meta(conn, round_no + 1, "setup")
 
@@ -330,14 +388,12 @@ with right:
 
 
 # ----------------------------
-# LEFT: Player View (default: own country first)
+# LEFT: Player View (default: own country)
 # ----------------------------
 with left:
     st.subheader("🎮 Spielerbereich")
 
-    # Spieler wählt sein Land (Dropdown zeigt display_name, intern bleibt Key)
-    # Wir merken es in session_state, damit es beim Reload default bleibt.
-    # Spieler-Land persistent & rerun-sicher
+    # Persistent player country selection (rerun-safe)
     if "my_country" not in st.session_state:
         st.session_state.my_country = countries[0]
 
@@ -345,11 +401,9 @@ with left:
     country_labels = [countries_display[k] for k in country_keys]
 
     def _on_country_change():
-        # label -> key zurück mappen
         label = st.session_state.my_country_label
         st.session_state.my_country = country_keys[country_labels.index(label)]
 
-    # Initialen Label-Wert setzen (nur wenn noch nicht da)
     if "my_country_label" not in st.session_state:
         st.session_state.my_country_label = countries_display[st.session_state.my_country]
 
@@ -362,8 +416,6 @@ with left:
 
     my_country = st.session_state.my_country
 
-
-    # Actions / locks for this round
     actions_texts = get_round_actions(conn, round_no)
     locks_now = get_locks(conn, round_no)
 
@@ -376,34 +428,30 @@ with left:
     else:
         render_metrics(my_metrics)
 
-        st.write("---")
-        # --- Siegfortschritt (nur für mein Land)
-        eu_now = get_eu_state(conn)
-        is_winner, cond_results = evaluate_country_win_conditions(
-            my_country,
-            country_metrics=my_metrics,
-            eu_state=eu_now,
-            country_defs=COUNTRY_DEFS,
-        )
-
-        st.write("---")
-        st.subheader("🏁 Siegfortschritt")
-
-        if not cond_results:
-            st.warning("Für dieses Land sind noch keine Siegbedingungen definiert (countries.py: win_conditions).")
-        else:
-            if is_winner:
-                st.success("✅ Siegbedingungen erfüllt! Du hast gewonnen.")
+        # Optional: eigener Siegfortschritt
+        if evaluate_country_win_conditions is not None:
+            eu_now = get_eu_state(conn)
+            is_winner, cond_results = evaluate_country_win_conditions(
+                my_country,
+                country_metrics=my_metrics,
+                eu_state=eu_now,
+                country_defs=COUNTRY_DEFS,
+            )
+            st.write("---")
+            st.subheader("🏁 Siegfortschritt")
+            if not cond_results:
+                st.warning("Für dieses Land sind noch keine Siegbedingungen definiert (countries.py: win_conditions).")
             else:
-                st.info("Noch nicht gewonnen — es fehlen noch Bedingungen:")
-
-            for r in cond_results:
-                if r.ok:
-                    st.write(f"✅ {r.label}  (aktuell: {r.current})")
+                if is_winner:
+                    st.success("✅ Siegbedingungen erfüllt! Du hast gewonnen.")
                 else:
-                    st.write(f"❌ {r.label}  (aktuell: {r.current})")
+                    st.info("Noch nicht gewonnen — Bedingungen:")
+                for r in cond_results:
+                    st.write(("✅ " if r.ok else "❌ ") + f"{r.label} (aktuell: {r.current})")
+
         st.write("---")
-        # Aktionen: nur eigenes Land sichtbar
+
+        # Actions: only own country
         if phase != "actions_published":
             st.info("Optionen sind noch nicht veröffentlicht. Warte auf den Game Master.")
         else:
@@ -449,8 +497,8 @@ Kontext: {r[7]}
 
     st.write("---")
     with st.expander("🌍 Andere Länder (nur Metriken/History)"):
-        tabs = st.tabs([countries_display[c] for c in countries if c != my_country])
         other_countries = [c for c in countries if c != my_country]
+        tabs = st.tabs([countries_display[c] for c in other_countries])
 
         for idx, c in enumerate(other_countries):
             with tabs[idx]:
