@@ -6,14 +6,13 @@ from typing import Dict, Any, List, Tuple
 import streamlit as st
 from dotenv import load_dotenv
 
-
 from countries import COUNTRY_DEFS, EU_DEFAULT
+
 from db import (
     get_conn,
     ensure_schema,
     seed_countries_if_missing,
     reset_all_countries,
-    reset_country_to_defaults,
     load_country_metrics,
     load_all_country_metrics,
     load_recent_history,
@@ -24,6 +23,7 @@ from db import (
     clear_round_data,
     upsert_round_actions,
     get_round_actions,
+    get_round_action_impacts,
     lock_choice,
     get_locks,
     all_locked,
@@ -36,9 +36,13 @@ from db import (
     clear_external_events,
     upsert_external_event,
     get_external_events,
-    get_round_action_impacts,
-
+    # auth
+    create_user,
+    verify_user,
+    list_users,
+    delete_user,
 )
+
 from ai_round import generate_actions_for_country, resolve_round_all_countries, generate_round_summary
 from ai_external import generate_external_moves
 
@@ -64,19 +68,7 @@ def summarize_recent_actions(rows) -> str:
     return " | ".join(items)
 
 
-def render_metrics(metrics: Dict[str, Any]):
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Wirtschaft", metrics["economy"])
-    c2.metric("Stabilität", metrics["stability"])
-    c3.metric("Militär", metrics["military"])
-    c4, c5 = st.columns(2)
-    c4.metric("Diplomatie", metrics["diplomatic_influence"])
-    c5.metric("Öffentliche Zustimmung", metrics["public_approval"])
-    with st.expander("Ambition"):
-        st.write(metrics["ambition"])
-
 def pressure_badge(label: str, value: int) -> str:
-    # 0..100
     if value >= 70:
         icon = "🔴"
         lvl = "hoch"
@@ -88,6 +80,28 @@ def pressure_badge(label: str, value: int) -> str:
         lvl = "niedrig"
     return f"{icon} {label}: {lvl}"
 
+
+def render_metrics(metrics: Dict[str, Any]):
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Wirtschaft", metrics["economy"])
+    c2.metric("Stabilität", metrics["stability"])
+    c3.metric("Militär", metrics["military"])
+    c4, c5 = st.columns(2)
+    c4.metric("Diplomatie", metrics["diplomatic_influence"])
+    c5.metric("Öffentliche Zustimmung", metrics["public_approval"])
+    with st.expander("Ambition"):
+        st.write(metrics["ambition"])
+
+
+def format_external_events(events: List[Dict[str, Any]]) -> str:
+    if not events:
+        return "Keine."
+    lines = []
+    for e in events:
+        lines.append(f"- {e.get('actor')}: {e.get('headline')}")
+    return "\n".join(lines)
+
+
 def _arrow(delta: int) -> str:
     if delta >= 3:
         return "⬆️"
@@ -95,12 +109,8 @@ def _arrow(delta: int) -> str:
         return "⬇️"
     return "➖"
 
+
 def impact_preview_text(folgen: Dict[str, Any]) -> str:
-    """
-    Folgen-Schema: {"land": {"militär":..,"stabilität":..,"wirtschaft":..,"diplomatie":..,"öffentliche_zustimmung":..},
-                    "eu": {"kohäsion":..},
-                    "global_context": "..."}
-    """
     land = (folgen or {}).get("land", {}) or {}
     eu = (folgen or {}).get("eu", {}) or {}
 
@@ -111,7 +121,6 @@ def impact_preview_text(folgen: Dict[str, Any]) -> str:
     dp = int(land.get("öffentliche_zustimmung", 0))
     dcoh = int(eu.get("kohäsion", 0))
 
-    # Risiko grob: max abs delta
     max_abs = max(abs(dm), abs(ds), abs(de), abs(dd), abs(dp), abs(dcoh))
     if max_abs >= 9:
         risk = "Risiko: 🔥 hoch"
@@ -124,15 +133,6 @@ def impact_preview_text(folgen: Dict[str, Any]) -> str:
         f"Mil {_arrow(dm)}  Sta {_arrow(ds)}  Wir {_arrow(de)}  Dip {_arrow(dd)}  Zust {_arrow(dp)}  "
         f"EU {_arrow(dcoh)}  •  {risk}"
     )
-
-
-def format_external_events(events: List[Dict[str, Any]]) -> str:
-    if not events:
-        return "Keine."
-    lines = []
-    for e in events:
-        lines.append(f"- {e.get('actor')}: {e.get('headline')}")
-    return "\n".join(lines)
 
 
 def build_action_prompt(
@@ -191,21 +191,10 @@ Regeln:
 
 
 def apply_external_modifiers_to_eu(eu_before: Dict[str, Any], moves_obj: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Add deltas from external moves into EU state (clamped later by set_eu_state).
-    We treat these as "pressures for this round" that persist.
-    """
     eu = dict(eu_before)
     moves = moves_obj.get("moves", [])
 
-    d_coh = 0
-    d_threat = 0
-    d_front = 0
-    d_energy = 0
-    d_migr = 0
-    d_disinfo = 0
-    d_trade = 0
-
+    d_coh = d_threat = d_front = d_energy = d_migr = d_disinfo = d_trade = 0
     for m in moves:
         mods = m.get("modifiers", {}) or {}
         d_coh += int(mods.get("eu_cohesion_delta", 0))
@@ -224,7 +213,6 @@ def apply_external_modifiers_to_eu(eu_before: Dict[str, Any], moves_obj: Dict[st
     eu["disinfo_pressure"] = eu["disinfo_pressure"] + d_disinfo
     eu["trade_war_pressure"] = eu["trade_war_pressure"] + d_trade
 
-    # update global context (model provided)
     if moves_obj.get("global_context"):
         eu["global_context"] = str(moves_obj["global_context"])
 
@@ -232,10 +220,6 @@ def apply_external_modifiers_to_eu(eu_before: Dict[str, Any], moves_obj: Dict[st
 
 
 def decay_pressures(eu: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Small natural decay to avoid permanent ratcheting.
-    Threat/frontline decay slower; others decay faster.
-    """
     out = dict(eu)
     out["threat_level"] = out["threat_level"] - 2
     out["frontline_pressure"] = out["frontline_pressure"] - 2
@@ -246,13 +230,121 @@ def decay_pressures(eu: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def render_player_view(
+    *,
+    conn,
+    round_no: int,
+    phase: str,
+    eu: Dict[str, Any],
+    countries_display: Dict[str, str],
+    my_country: str,
+    is_lock_disabled: bool,
+):
+    actions_texts = get_round_actions(conn, round_no)
+    action_impacts = get_round_action_impacts(conn, round_no)
+    locks_now = get_locks(conn, round_no)
+
+    st.subheader(f"🏳️ Land: {countries_display[my_country]}")
+    my_metrics = load_country_metrics(conn, my_country)
+    if not my_metrics:
+        st.error("Land konnte nicht geladen werden.")
+        return
+
+    render_metrics(my_metrics)
+
+    if evaluate_country_win_conditions is not None:
+        eu_now = get_eu_state(conn)
+        is_winner, cond_results = evaluate_country_win_conditions(
+            my_country,
+            country_metrics=my_metrics,
+            eu_state=eu_now,
+            country_defs=COUNTRY_DEFS,
+        )
+        st.write("---")
+        st.subheader("🏁 Siegfortschritt")
+        if not cond_results:
+            st.warning("Für dieses Land sind noch keine Siegbedingungen definiert (countries.py: win_conditions).")
+        else:
+            if is_winner:
+                st.success("✅ Siegbedingungen erfüllt! Du hast gewonnen.")
+            else:
+                st.info("Noch nicht gewonnen — Bedingungen:")
+            for r in cond_results:
+                st.write(("✅ " if r.ok else "❌ ") + f"{r.label} (aktuell: {r.current})")
+
+    st.write("---")
+
+    if phase != "actions_published":
+        st.info("Optionen sind noch nicht veröffentlicht. Warte auf den Game Master.")
+    else:
+        a = actions_texts.get(my_country, {})
+        if not a or len(a) < 3:
+            st.warning("Optionen fehlen noch (GM muss Aktionen generieren und veröffentlichen).")
+        else:
+            st.subheader("Öffentliche Aktion wählen")
+
+            if my_country in locks_now:
+                st.success("✅ Eingelockt. (Welche Variante bleibt für andere verborgen.)")
+            else:
+                st.warning("⏳ Noch nicht eingelockt.")
+
+            options = {
+                "aggressiv": a["aggressiv"],
+                "moderate": a["moderate"],
+                "passiv": a["passiv"],
+            }
+            labels = [options["aggressiv"], options["moderate"], options["passiv"]]
+            choice_label = st.radio("Option:", labels, index=1)
+            chosen_variant = next(k for k, v in options.items() if v == choice_label)
+
+            folgen = (action_impacts.get(my_country, {}) or {}).get(chosen_variant, {}) or {}
+            if folgen:
+                st.caption("**Voraussichtliche Wirkung:** " + impact_preview_text(folgen))
+            else:
+                st.caption("Voraussichtliche Wirkung: (noch keine Daten / alte Runde ohne Impact gespeichert)")
+
+            with st.expander("Alle Wirkungen vergleichen", expanded=False):
+                for v in ("aggressiv", "moderate", "passiv"):
+                    folgen_v = (action_impacts.get(my_country, {}) or {}).get(v, {}) or {}
+                    st.write(f"**{v.capitalize()}**")
+                    st.write(options[v])
+                    if folgen_v:
+                        st.caption(impact_preview_text(folgen_v))
+                    else:
+                        st.caption("(keine Impact-Daten)")
+                    st.write("---")
+
+            if st.button("✅ Auswahl einlocken", use_container_width=True, disabled=is_lock_disabled):
+                lock_choice(conn, round_no, my_country, chosen_variant)
+                st.rerun()
+
+            if is_lock_disabled:
+                st.caption("GM-Hinweis: In der simulierten Spieleransicht ist Einlocken deaktiviert.")
+
+    with st.expander("Turn-History (Mein Land)"):
+        rows = load_recent_history(conn, my_country, limit=12)
+        if not rows:
+            st.write("Noch keine Runden gespielt.")
+        else:
+            for r in rows:
+                st.markdown(
+                    f"""
+**Runde {r[0]}**  
+Aktion: {r[1]}  
+Δ Militär {r[2]}, Δ Stabilität {r[3]}, Δ Wirtschaft {r[4]}, Δ Diplomatie {r[5]}, Δ Zustimmung {r[6]}  
+Kontext: {r[7]}
+"""
+                )
+
+
 # ----------------------------
 # App start
 # ----------------------------
-st.set_page_config(page_title="EU Geopolitik (GM + Außenmächte)", layout="wide")
-st.title("EU Geopolitik-Prototyp — Game Master Flow + USA/China/Russland")
+st.set_page_config(page_title="EU Geopolitik (Login + GM + Außenmächte)", layout="wide")
+st.title("EU Geopolitik — Login + Game Master + USA/China/Russland")
 
 load_env()
+
 api_key = (os.getenv("MISTRAL_API_KEY") or "").strip()
 if not api_key:
     st.error("MISTRAL_API_KEY fehlt. Lege eine .env neben app.py an: MISTRAL_API_KEY=... ")
@@ -267,13 +359,116 @@ seed_countries_if_missing(conn, COUNTRY_DEFS)
 countries = list(COUNTRY_DEFS.keys())
 countries_display = {k: COUNTRY_DEFS[k]["display_name"] for k in countries}
 
+# ----------------------------
+# Auth gate
+# ----------------------------
+if "auth" not in st.session_state:
+    st.session_state.auth = None
+
+if st.session_state.auth is None:
+    st.subheader("🔐 Login")
+    with st.form("login_form"):
+        username = st.text_input("Username")
+        password = st.text_input("Passwort", type="password")
+        submitted = st.form_submit_button("Einloggen")
+
+    if submitted:
+        user = verify_user(conn, username=username, password=password)
+        if not user:
+            st.error("Login fehlgeschlagen.")
+        else:
+            st.session_state.auth = user
+            st.rerun()
+
+    st.info("Bitte einloggen. (User werden vom Game Master erstellt.)")
+    conn.close()
+    st.stop()
+
+auth = st.session_state.auth
+is_gm = auth["role"] == "gm"
+assigned_country = auth.get("country")
+
+st.sidebar.write(f"👤 **{auth['username']}**")
+st.sidebar.write(f"Rolle: **{auth['role']}**")
+if assigned_country:
+    st.sidebar.write(f"Land: **{assigned_country}**")
+
+if st.sidebar.button("🚪 Logout"):
+    st.session_state.auth = None
+    st.rerun()
+
+if is_gm and gm_pin:
+    entered = st.sidebar.text_input("GM PIN", type="password")
+    if entered != gm_pin:
+        st.sidebar.warning("PIN erforderlich.")
+        conn.close()
+        st.stop()
+
+# ----------------------------
+# GM: Spieleransicht simulieren
+# ----------------------------
+if "gm_view_enabled" not in st.session_state:
+    st.session_state.gm_view_enabled = False
+if "gm_view_country" not in st.session_state:
+    st.session_state.gm_view_country = None
+
+if is_gm:
+    with st.sidebar.expander("🕵️ Spieleransicht simulieren", expanded=False):
+        st.session_state.gm_view_enabled = st.checkbox(
+            "Spieleransicht aktivieren",
+            value=st.session_state.gm_view_enabled,
+        )
+        if st.session_state.gm_view_enabled:
+            opts = list(COUNTRY_DEFS.keys())
+            if st.session_state.gm_view_country not in opts:
+                st.session_state.gm_view_country = opts[0]
+            st.session_state.gm_view_country = st.selectbox(
+                "Als Spieler ansehen (Land)",
+                options=opts,
+                index=opts.index(st.session_state.gm_view_country),
+            )
+        else:
+            st.session_state.gm_view_country = None
+
+# Effective country for player UI
+effective_country = None
+is_simulating_player_view = False
+if is_gm and st.session_state.get("gm_view_enabled") and st.session_state.get("gm_view_country"):
+    effective_country = st.session_state.gm_view_country
+    is_simulating_player_view = True
+elif not is_gm:
+    effective_country = assigned_country
+
+if not is_gm and not effective_country:
+    st.error("Kein Land zugewiesen. GM muss dir ein Land zuweisen.")
+    conn.close()
+    st.stop()
+
+# ----------------------------
+# Sidebar: Quick guide
+# ----------------------------
+with st.sidebar.expander("📘 Werte erklärt (Kurz)", expanded=False):
+    st.markdown("""
+**Militär**: Abschreckung/Verteidigung. Hilft bei hohem Threat/Frontline, kann innenpolitisch polarisieren.  
+**Stabilität**: Regierungsfähigkeit/Protestresistenz. Niedrig → Krisenanfälligkeit.  
+**Wirtschaft**: Wachstum/Inflation/Haushalt. Niedrig → Zustimmung fällt schneller.  
+**Diplomatie**: Fähigkeit zu Deals/Koalitionen/Sanktionen. Hoch → bessere Kompromisse.  
+**Öffentliche Zustimmung**: Rückendeckung. Niedrig → riskante Entscheidungen “kosten” stärker.
+
+**Druckwerte (EU):**  
+**Threat/Frontline** = Kriegsrisiko & Ostflanken-Spannung.  
+**Energy/Migration/Disinfo/TradeWar** erhöhen innenpolitischen Stress & Spaltung.
+""")
+
+# ----------------------------
+# DB states
+# ----------------------------
 meta = get_game_meta(conn)
 round_no = meta["round"]
 phase = meta["phase"]  # setup -> external_generated -> actions_generated -> actions_published
 
 eu = get_eu_state(conn)
 if not eu["global_context"]:
-    # if EU_DEFAULT doesn't include these keys, keep DB defaults
     set_eu_state(
         conn,
         cohesion=EU_DEFAULT.get("cohesion", eu["cohesion"]),
@@ -287,62 +482,82 @@ if not eu["global_context"]:
     )
     eu = get_eu_state(conn)
 
-# Sidebar
-st.sidebar.header("Rolle")
-role = st.sidebar.selectbox("Ansicht", ["Spieler", "Game Master"], index=0)
-is_gm = (role == "Game Master")
+# ----------------------------
+# GM: User management
+# ----------------------------
+if is_gm:
+    with st.sidebar.expander("👥 User verwalten", expanded=False):
+        st.caption("User in SQLite. Passwörter: PBKDF2 + Salt + Pepper (.env).")
+        with st.form("create_user_form"):
+            new_u = st.text_input("Neuer Username")
+            new_p = st.text_input("Neues Passwort", type="password")
+            new_role = st.selectbox("Rolle", ["player", "gm"], index=0)
+            new_country = None
+            if new_role == "player":
+                new_country = st.selectbox("Land zuweisen", list(COUNTRY_DEFS.keys()))
+            submitted = st.form_submit_button("User anlegen/aktualisieren")
+        if submitted:
+            try:
+                create_user(conn, username=new_u, password=new_p, role=new_role, country=new_country)
+                st.success("User gespeichert.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Fehler: {e}")
 
+        st.write("---")
+        st.write("**Bestehende User**")
+        for u in list_users(conn):
+            st.write(f"- {u['username']} ({u['role']}) {('→ ' + u['country']) if u['country'] else ''}")
 
+        del_u = st.text_input("Username löschen")
+        if st.button("User löschen"):
+            delete_user(conn, del_u)
+            st.success("Gelöscht.")
+            st.rerun()
 
-if is_gm and gm_pin:
-    entered = st.sidebar.text_input("GM PIN", type="password")
-    if entered != gm_pin:
-        st.sidebar.warning("PIN erforderlich.")
-        st.stop()
+# ----------------------------
+# Sidebar: reset (GM only)
+# ----------------------------
+if is_gm:
+    st.sidebar.write("---")
+    st.sidebar.subheader("Reset")
+    if st.sidebar.button("💣 Reset alle"):
+        reset_all_countries(conn, COUNTRY_DEFS)
+        clear_round_data(conn, round_no)
+        clear_all_round_summaries(conn)
+        clear_external_events(conn, round_no)
+        set_eu_state(
+            conn,
+            cohesion=EU_DEFAULT.get("cohesion", 75),
+            global_context=EU_DEFAULT.get("global_context", ""),
+            threat_level=35,
+            frontline_pressure=30,
+            energy_pressure=25,
+            migration_pressure=25,
+            disinfo_pressure=25,
+            trade_war_pressure=25,
+        )
+        set_game_meta(conn, 1, "setup")
+        st.rerun()
 
-st.sidebar.write("---")
-st.sidebar.write(f"**Runde:** {round_no}")
-st.sidebar.write(f"**Phase:** {phase}")
-st.sidebar.write(f"**EU-Kohäsion:** {eu['cohesion']}%")
-st.sidebar.caption(eu["global_context"])
-
-st.sidebar.write("---")
-st.sidebar.subheader("Reset")
-colA, colB = st.sidebar.columns(2)
-if colB.button("💣 Reset alle"):
-    reset_all_countries(conn, COUNTRY_DEFS)
-    clear_round_data(conn, round_no)
-    clear_all_round_summaries(conn)
-    clear_external_events(conn, round_no)
-
-    # reset EU to defaults + pressures to baseline
-    set_eu_state(
-        conn,
-        cohesion=EU_DEFAULT.get("cohesion", 75),
-        global_context=EU_DEFAULT.get("global_context", ""),
-        threat_level=35,
-        frontline_pressure=30,
-        energy_pressure=25,
-        migration_pressure=25,
-        disinfo_pressure=25,
-        trade_war_pressure=25,
-    )
-    set_game_meta(conn, 1, "setup")
-    st.rerun()
-
+# ----------------------------
+# Layout
+# ----------------------------
 left, right = st.columns([0.62, 0.38], gap="large")
 
 # ----------------------------
-# RIGHT: Status/Overview
+# RIGHT: Status + GM controls (GM) / Status (Player)
 # ----------------------------
 with right:
     st.subheader("📊 Rundenstatus")
+    st.write(f"**Runde:** {round_no}  |  **Phase:** {phase}")
 
     locks = get_locks(conn, round_no)
     st.write("**Lock-Status (diese Runde)**")
     for c in countries:
         name = countries_display[c]
         if c in locks:
+            # GM sieht Variante, Spieler nicht
             if is_gm:
                 st.success(f"{name}: ✅ eingelockt ({locks[c]})")
             else:
@@ -358,17 +573,12 @@ with right:
     c1.write(pressure_badge("Frontline", eu["frontline_pressure"]))
     c2.write(pressure_badge("Energy", eu["energy_pressure"]))
     c2.write(pressure_badge("Migration", eu["migration_pressure"]))
-
     with st.expander("Mehr Details (Druckwerte)"):
         st.write(f"Disinfo: {eu['disinfo_pressure']} / 100")
         st.write(f"TradeWar: {eu['trade_war_pressure']} / 100")
-
     st.caption(eu["global_context"])
 
-
     st.write("---")
-
-    # External events preview (public headlines)
     ext_events = get_external_events(conn, round_no)
     with st.expander("🌐 Außenmächte-Moves (öffentlich)"):
         if not ext_events:
@@ -377,7 +587,6 @@ with right:
             for e in ext_events:
                 st.markdown(f"**{e['actor']}**: {e['headline']}")
 
-    # Memory (safe for everyone)
     st.write("---")
     with st.expander("🧠 Letzte Runden (Memory)"):
         mem = get_recent_round_summaries(conn, limit=5)
@@ -389,7 +598,6 @@ with right:
 
     st.write("---")
 
-    # Optional winners
     if evaluate_all_countries is not None:
         all_metrics_now = load_all_country_metrics(conn, countries)
         eu_now = get_eu_state(conn)
@@ -398,13 +606,11 @@ with right:
             eu_state=eu_now,
             country_defs=COUNTRY_DEFS,
         )
-
         winners = [countries_display[c] for c in countries if win_eval.get(c, {}).get("is_winner")]
         if winners:
             st.success("🏆 Gewinner erreicht: " + ", ".join(winners))
         else:
             st.caption("Noch kein Land hat die Siegbedingungen vollständig erfüllt.")
-
         if is_gm:
             with st.expander("📈 Siegfortschritt (GM Detail)"):
                 for c in countries:
@@ -417,12 +623,8 @@ with right:
                         st.write(("✅ " if r.ok else "❌ ") + f"{r.label} (aktuell: {r.current})")
         st.write("---")
 
-    # ----------------------------
-    # GM Controls
-    # ----------------------------
-    if not is_gm:
-        st.info("Für Rundensteuerung: in der Sidebar zu **Game Master** wechseln.")
-    else:
+    # GM controls
+    if is_gm:
         st.subheader("🎛️ Game Master Steuerung (sequenziell)")
 
         actions_in_db = get_round_actions(conn, round_no)
@@ -431,7 +633,6 @@ with right:
         have_external = len(get_external_events(conn, round_no)) == 3
 
         # 1) External moves
-        # allowed until published (setup/external_generated/actions_generated)
         external_disabled = (phase == "actions_published")
         if st.button("⚠️ Außenmächte-Züge generieren (USA/China/Russland)", disabled=external_disabled, use_container_width=True):
             with st.spinner("Generiere Außenmächte-Moves..."):
@@ -449,7 +650,6 @@ with right:
                     max_tokens=900,
                 )
 
-                # save events
                 clear_external_events(conn, round_no)
                 for m in moves_obj["moves"]:
                     upsert_external_event(
@@ -460,7 +660,6 @@ with right:
                         modifiers=m.get("modifiers", {}),
                     )
 
-                # apply modifiers to EU pressures + global_context
                 eu_after = apply_external_modifiers_to_eu(eu_before, moves_obj)
                 set_eu_state(
                     conn,
@@ -474,7 +673,6 @@ with right:
                     trade_war_pressure=eu_after["trade_war_pressure"],
                 )
 
-                # phase advance
                 set_game_meta(conn, round_no, "external_generated")
             st.rerun()
 
@@ -497,7 +695,7 @@ with right:
                         external_events=ext_now,
                         recent_actions_summary=summarize_recent_actions(recent),
                     )
-                    actions_obj, raw_first, used_repair = generate_actions_for_country(
+                    actions_obj, _raw_first, _used_repair = generate_actions_for_country(
                         api_key=api_key,
                         model="mistral-small",
                         prompt=prompt,
@@ -510,7 +708,6 @@ with right:
                 set_game_meta(conn, round_no, "actions_generated")
             st.rerun()
 
-        # GM preview of actions
         actions_in_db = get_round_actions(conn, round_no)
         if actions_in_db:
             with st.expander("👀 Vorschau: Generierte Länderaktionen (GM)"):
@@ -541,16 +738,12 @@ with right:
 
                 actions_texts = get_round_actions(conn, round_no)
                 locks_now = get_locks(conn, round_no)
-                action_impacts = get_round_action_impacts(conn, round_no)
                 all_metrics = load_all_country_metrics(conn, countries)
 
-                # chosen actions string (for summary)
                 chosen_actions_lines = []
                 for c in countries:
                     v = locks_now[c]
-                    chosen_actions_lines.append(
-                        f"- {countries_display[c]} ({c}): {v} -> {actions_texts[c][v]}"
-                    )
+                    chosen_actions_lines.append(f"- {countries_display[c]} ({c}): {v} -> {actions_texts[c][v]}")
                 chosen_actions_str = "\n".join(chosen_actions_lines)
 
                 result = resolve_round_all_countries(
@@ -569,7 +762,6 @@ with right:
                     max_tokens=1700,
                 )
 
-                # Apply EU: cohesion + new global_context (keep pressures, then decay them slightly)
                 eu_after = dict(eu_before)
                 eu_after["cohesion"] = eu_before["cohesion"] + int(result["eu"].get("kohäsion_delta", 0))
                 eu_after["global_context"] = str(result["eu"].get("global_context", eu_before["global_context"]))
@@ -587,7 +779,6 @@ with right:
                     trade_war_pressure=eu_after["trade_war_pressure"],
                 )
 
-                # Apply countries + history
                 for c in countries:
                     d = result["länder"][c] or {}
                     apply_country_deltas(conn, c, d)
@@ -603,7 +794,6 @@ with right:
                         deltas=d,
                     )
 
-                # Summary (Stufe 2)
                 eu_after_fresh = get_eu_state(conn)
                 summary_text = generate_round_summary(
                     api_key=api_key,
@@ -621,7 +811,6 @@ with right:
                 )
                 upsert_round_summary(conn, round_no, summary_text)
 
-                # Next round: clear round data + external events, move phase to setup
                 clear_round_data(conn, round_no)
                 clear_external_events(conn, round_no)
                 set_game_meta(conn, round_no + 1, "setup")
@@ -631,183 +820,34 @@ with right:
 
         st.caption("Flow: Außenmächte → Aktionen generieren → Veröffentlichen → Lock → Resolve")
 
-
 # ----------------------------
-# LEFT: Player View (own country)
+# LEFT: Player UI (Players always; GM only if simulating)
 # ----------------------------
 with left:
-    st.subheader("🎮 Spielerbereich")
-
-    # persistent selection (rerun-safe)
-    if "my_country" not in st.session_state:
-        st.session_state.my_country = countries[0]
-
-    country_keys = countries
-    country_labels = [countries_display[k] for k in country_keys]
-
-    def _on_country_change():
-        label = st.session_state.my_country_label
-        st.session_state.my_country = country_keys[country_labels.index(label)]
-
-    if "my_country_label" not in st.session_state:
-        st.session_state.my_country_label = countries_display[st.session_state.my_country]
-
-    st.selectbox(
-        "Ich spiele:",
-        country_labels,
-        key="my_country_label",
-        on_change=_on_country_change,
-    )
-
-    my_country = st.session_state.my_country
-
-    actions_texts = get_round_actions(conn, round_no)
-    locks_now = get_locks(conn, round_no)
-    action_impacts = get_round_action_impacts(conn, round_no)
-
-    st.write("---")
-    st.subheader(f"🏳️ Mein Land: {countries_display[my_country]}")
-
-    my_metrics = load_country_metrics(conn, my_country)
-    if not my_metrics:
-        st.error("Mein Land konnte nicht geladen werden.")
-    else:
-        with st.sidebar.expander("📘 Werte erklärt (Kurz)", expanded=False):
-            st.markdown("""
-        **Militär**: Abschreckung/Verteidigung. Hilft bei hohem Threat/Frontline, kann innenpolitisch polarisieren. 
-                        
-        **Stabilität**: Regierungsfähigkeit/Protestresistenz. Niedrig → Krisenanfälligkeit.  
-                        
-        **Wirtschaft**: Wachstum/Inflation/Haushalt. Niedrig → Zustimmung fällt schneller.  
-                        
-        **Diplomatie**: Fähigkeit zu Deals/Koalitionen/Sanktionen. Hoch → bessere Kompromisse.  
-                        
-        **Öffentliche Zustimmung**: Rückendeckung. Niedrig → riskante Entscheidungen “kosten” stärker.
-
-        **Druckwerte (EU):**  
-        **Threat/Frontline** = Kriegsrisiko & Ostflanken-Spannung.  
-        **Energy/Migration/Disinfo/TradeWar** erhöhen innenpolitischen Stress & Spaltung.
-        """)
-        render_metrics(my_metrics)
-    
-        # optional win progress
-        if evaluate_country_win_conditions is not None:
-            eu_now = get_eu_state(conn)
-            is_winner, cond_results = evaluate_country_win_conditions(
-                my_country,
-                country_metrics=my_metrics,
-                eu_state=eu_now,
-                country_defs=COUNTRY_DEFS,
-            )
-            st.write("---")
-            st.subheader("🏁 Siegfortschritt")
-            if not cond_results:
-                st.warning("Für dieses Land sind noch keine Siegbedingungen definiert (countries.py: win_conditions).")
-            else:
-                if is_winner:
-                    st.success("✅ Siegbedingungen erfüllt! Du hast gewonnen.")
-                else:
-                    st.info("Noch nicht gewonnen — Bedingungen:")
-                for r in cond_results:
-                    st.write(("✅ " if r.ok else "❌ ") + f"{r.label} (aktuell: {r.current})")
-
-        st.write("---")
-
-        # Actions: only own, only when published
-        if phase != "actions_published":
-            st.info("Optionen sind noch nicht veröffentlicht. Warte auf den Game Master.")
+    if is_gm:
+        st.subheader("🎮 Spieleransicht (GM Simulation)")
+        if not is_simulating_player_view or not effective_country:
+            st.info("Aktiviere in der Sidebar 'Spieleransicht simulieren' und wähle ein Land.")
         else:
-            a = actions_texts.get(my_country, {})
-            if not a or len(a) < 3:
-                st.warning("Optionen fehlen noch (GM muss Aktionen generieren und veröffentlichen).")
-            else:
-                st.subheader("Öffentliche Aktion wählen")
-
-                if my_country in locks_now:
-                    st.success("Du bist eingelockt. (Welche Variante bleibt für andere verborgen.)")
-                else:
-                    st.warning("Du bist noch nicht eingelockt.")
-
-                options = {
-                    "aggressiv": a["aggressiv"],
-                    "moderate": a["moderate"],
-                    "passiv": a["passiv"],
-                }
-                labels = [options["aggressiv"], options["moderate"], options["passiv"]]
-                choice_label = st.radio("Option:", labels, index=1)
-                chosen_variant = next(k for k, v in options.items() if v == choice_label)
-
-                # Impact Preview (nur eigenes Land)
-                folgen = (action_impacts.get(my_country, {}) or {}).get(chosen_variant, {}) or {}
-                if folgen:
-                    st.caption("**Voraussichtliche Wirkung:** " + impact_preview_text(folgen))
-                else:
-                    st.caption("Voraussichtliche Wirkung: (noch keine Daten / alte Runde ohne Impact gespeichert)")
-
-                with st.expander("Alle Wirkungen vergleichen", expanded=False):
-                    for v in ("aggressiv", "moderate", "passiv"):
-                        folgen_v = (action_impacts.get(my_country, {}) or {}).get(v, {}) or {}
-                        st.write(f"**{v.capitalize()}**")
-                        st.write(options[v])
-                        if folgen_v:
-                            st.caption(impact_preview_text(folgen_v))
-                        else:
-                            st.caption("(keine Impact-Daten)")
-                        st.write("---")
-
-                # Impact Preview (nur eigenes Land)
-                #folgen = (action_impacts.get(my_country, {}) or {}).get(chosen_variant, {}) or {}
-                #if folgen:
-                #    st.caption("**Voraussichtliche Wirkung:** " + impact_preview_text(folgen))
-                #else:
-                #    st.caption("Voraussichtliche Wirkung: (noch keine Daten / alte Runde ohne Impact gespeichert)")
-
-                if st.button("✅ Auswahl einlocken", use_container_width=True):
-                    lock_choice(conn, round_no, my_country, chosen_variant)
-                    st.rerun()
-
-        with st.expander("Turn-History (Mein Land)"):
-            rows = load_recent_history(conn, my_country, limit=12)
-            if not rows:
-                st.write("Noch keine Runden gespielt.")
-            else:
-                for r in rows:
-                    st.markdown(
-                        f"""
-**Runde {r[0]}**  
-Aktion: {r[1]}  
-Δ Militär {r[2]}, Δ Stabilität {r[3]}, Δ Wirtschaft {r[4]}, Δ Diplomatie {r[5]}, Δ Zustimmung {r[6]}  
-Kontext: {r[7]}
-"""
-                    )
-
-    st.write("---")
-    with st.expander("🌍 Andere Länder (nur Metriken/History)"):
-        other_countries = [c for c in countries if c != my_country]
-        tabs = st.tabs([countries_display[c] for c in other_countries])
-
-        for idx, c in enumerate(other_countries):
-            with tabs[idx]:
-                m = load_country_metrics(conn, c)
-                if not m:
-                    st.error("Land konnte nicht geladen werden.")
-                    continue
-
-                render_metrics(m)
-
-                with st.expander("Turn-History"):
-                    rows = load_recent_history(conn, c, limit=12)
-                    if not rows:
-                        st.write("Noch keine Runden gespielt.")
-                    else:
-                        for r in rows:
-                            st.markdown(
-                                f"""
-**Runde {r[0]}**  
-Aktion: {r[1]}  
-Δ Militär {r[2]}, Δ Stabilität {r[3]}, Δ Wirtschaft {r[4]}, Δ Diplomatie {r[5]}, Δ Zustimmung {r[6]}  
-Kontext: {r[7]}
-"""
-                            )
+            render_player_view(
+                conn=conn,
+                round_no=round_no,
+                phase=phase,
+                eu=eu,
+                countries_display=countries_display,
+                my_country=effective_country,
+                is_lock_disabled=True,  # GM cannot lock in simulation
+            )
+    else:
+        st.subheader("🎮 Spielerbereich")
+        render_player_view(
+            conn=conn,
+            round_no=round_no,
+            phase=phase,
+            eu=eu,
+            countries_display=countries_display,
+            my_country=effective_country,
+            is_lock_disabled=False,
+        )
 
 conn.close()

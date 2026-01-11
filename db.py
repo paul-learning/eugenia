@@ -2,6 +2,9 @@
 import sqlite3
 from typing import Dict, Any, List, Tuple, Optional
 import json
+import os
+import base64
+import hashlib
 
 from utils import clamp_int
 
@@ -62,7 +65,6 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     """)
 
     # --- Migration for eu_state extra columns ---
-    # add external pressure indices
     if not _col_exists(conn, "eu_state", "threat_level"):
         cur.execute("ALTER TABLE eu_state ADD COLUMN threat_level INTEGER NOT NULL DEFAULT 35")
     if not _col_exists(conn, "eu_state", "frontline_pressure"):
@@ -91,15 +93,15 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     CREATE TABLE IF NOT EXISTS round_actions (
         round INTEGER NOT NULL,
         country TEXT NOT NULL,
-        variant TEXT NOT NULL,          -- aggressiv/moderate/passiv
+        variant TEXT NOT NULL,
         action_text TEXT NOT NULL,
         PRIMARY KEY (round, country, variant)
     )
     """)
-    # --- Migration: impact_json für Aktions-Vorschau (Spielerverständnis)
+
+    # --- Migration: impact_json for action previews ---
     if not _col_exists(conn, "round_actions", "impact_json"):
         cur.execute("ALTER TABLE round_actions ADD COLUMN impact_json TEXT")
-
 
     # Locks (players lock choice)
     cur.execute("""
@@ -125,10 +127,21 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     cur.execute("""
     CREATE TABLE IF NOT EXISTS external_events (
         round INTEGER NOT NULL,
-        actor TEXT NOT NULL,            -- USA/China/Russia
+        actor TEXT NOT NULL,
         headline TEXT NOT NULL,
-        modifiers_json TEXT NOT NULL,   -- JSON dict with deltas
+        modifiers_json TEXT NOT NULL,
         PRIMARY KEY (round, actor)
+    )
+    """)
+
+    # Users (auth)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        username TEXT PRIMARY KEY,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL,          -- "gm" oder "player"
+        country TEXT,               -- nur für player: z.B. "Germany"
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )
     """)
 
@@ -312,10 +325,6 @@ def load_all_country_metrics(conn: sqlite3.Connection, countries: List[str]) -> 
 
 
 def apply_country_deltas(conn: sqlite3.Connection, country: str, deltas: Dict[str, Any]) -> None:
-    """
-    Expected delta keys:
-    militär, stabilität, wirtschaft, diplomatie, öffentliche_zustimmung
-    """
     dm = int(deltas.get("militär", 0))
     ds = int(deltas.get("stabilität", 0))
     de = int(deltas.get("wirtschaft", 0))
@@ -404,9 +413,7 @@ def clear_round_data(conn: sqlite3.Connection, round_no: int) -> None:
 
 def upsert_round_actions(conn: sqlite3.Connection, round_no: int, country: str, actions_obj: Dict[str, Any]) -> None:
     """
-    Save action_text per variant (public) + impact_json (folgen).
-    impact_json enthält typischerweise:
-      {"land": {...}, "eu": {...}, "global_context": "..."}
+    Save action_text per variant + impact_json (folgen).
     """
     cur = conn.cursor()
     for variant in ("aggressiv", "moderate", "passiv"):
@@ -424,7 +431,6 @@ def upsert_round_actions(conn: sqlite3.Connection, round_no: int, country: str, 
     conn.commit()
 
 
-
 def get_round_actions(conn: sqlite3.Connection, round_no: int) -> Dict[str, Dict[str, str]]:
     cur = conn.cursor()
     cur.execute("""
@@ -436,10 +442,11 @@ def get_round_actions(conn: sqlite3.Connection, round_no: int) -> Dict[str, Dict
     for country, variant, action_text in cur.fetchall():
         out.setdefault(str(country), {})[str(variant)] = str(action_text)
     return out
+
+
 def get_round_action_impacts(conn: sqlite3.Connection, round_no: int) -> Dict[str, Dict[str, Dict[str, Any]]]:
     """
     returns: {country: {variant: folgen_dict}}
-    folgen_dict kann leer sein, wenn alte Daten ohne impact_json existieren.
     """
     cur = conn.cursor()
     cur.execute("""
@@ -551,3 +558,82 @@ def get_external_events(conn: sqlite3.Connection, round_no: int) -> List[Dict[st
             modifiers = {}
         out.append({"actor": str(actor), "headline": str(headline), "modifiers": modifiers})
     return out
+
+
+# -----------------------
+# Auth (PBKDF2 + pepper)
+# -----------------------
+def _get_pepper() -> bytes:
+    pepper = (os.getenv("APP_AUTH_PEPPER") or "").strip()
+    if not pepper:
+        raise RuntimeError("APP_AUTH_PEPPER fehlt in .env")
+    return pepper.encode("utf-8")
+
+
+def _hash_password(password: str, *, salt: bytes) -> str:
+    pepper = _get_pepper()
+    pw = password.encode("utf-8") + b"|" + pepper
+    dk = hashlib.pbkdf2_hmac("sha256", pw, salt, 200_000, dklen=32)
+    return base64.b64encode(salt).decode("ascii") + "$" + base64.b64encode(dk).decode("ascii")
+
+
+def create_user(conn: sqlite3.Connection, *, username: str, password: str, role: str, country: str | None = None) -> None:
+    username = username.strip()
+    if not username:
+        raise ValueError("username leer")
+    if role not in ("gm", "player"):
+        raise ValueError("role muss 'gm' oder 'player' sein")
+    if role == "player" and not country:
+        raise ValueError("player braucht country")
+    if role == "gm":
+        country = None
+
+    salt = os.urandom(16)
+    pw_hash = _hash_password(password, salt=salt)
+
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO users (username, password_hash, role, country)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(username) DO UPDATE SET
+          password_hash=excluded.password_hash,
+          role=excluded.role,
+          country=excluded.country
+    """, (username, pw_hash, role, country))
+    conn.commit()
+
+
+def verify_user(conn: sqlite3.Connection, *, username: str, password: str) -> dict | None:
+    cur = conn.cursor()
+    cur.execute("SELECT username, password_hash, role, country FROM users WHERE username=?", (username.strip(),))
+    row = cur.fetchone()
+    if not row:
+        return None
+
+    u, pw_hash, role, country = row
+    try:
+        salt_b64, _dk_b64 = pw_hash.split("$", 1)
+        salt = base64.b64decode(salt_b64.encode("ascii"))
+        expected = _hash_password(password, salt=salt)
+    except Exception:
+        return None
+
+    if expected != pw_hash:
+        return None
+
+    return {"username": str(u), "role": str(role), "country": (str(country) if country else None)}
+
+
+def list_users(conn: sqlite3.Connection) -> list[dict]:
+    cur = conn.cursor()
+    cur.execute("SELECT username, role, country, created_at FROM users ORDER BY role DESC, username ASC")
+    out = []
+    for u, r, c, ca in cur.fetchall():
+        out.append({"username": str(u), "role": str(r), "country": (str(c) if c else None), "created_at": str(ca)})
+    return out
+
+
+def delete_user(conn: sqlite3.Connection, username: str) -> None:
+    cur = conn.cursor()
+    cur.execute("DELETE FROM users WHERE username=?", (username.strip(),))
+    conn.commit()
