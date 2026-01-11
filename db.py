@@ -1,6 +1,7 @@
 # db.py
 import sqlite3
 from typing import Dict, Any, List, Tuple, Optional
+import json
 
 from utils import clamp_int
 
@@ -9,6 +10,13 @@ DB_PATH = "game.db"
 
 def get_conn() -> sqlite3.Connection:
     return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+
+def _col_exists(conn: sqlite3.Connection, table: str, col: str) -> bool:
+    cur = conn.cursor()
+    cur.execute(f"PRAGMA table_info({table})")
+    cols = [r[1] for r in cur.fetchall()]
+    return col in cols
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
@@ -53,6 +61,22 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     )
     """)
 
+    # --- Migration for eu_state extra columns ---
+    # add external pressure indices
+    if not _col_exists(conn, "eu_state", "threat_level"):
+        cur.execute("ALTER TABLE eu_state ADD COLUMN threat_level INTEGER NOT NULL DEFAULT 35")
+    if not _col_exists(conn, "eu_state", "frontline_pressure"):
+        cur.execute("ALTER TABLE eu_state ADD COLUMN frontline_pressure INTEGER NOT NULL DEFAULT 30")
+
+    if not _col_exists(conn, "eu_state", "energy_pressure"):
+        cur.execute("ALTER TABLE eu_state ADD COLUMN energy_pressure INTEGER NOT NULL DEFAULT 25")
+    if not _col_exists(conn, "eu_state", "migration_pressure"):
+        cur.execute("ALTER TABLE eu_state ADD COLUMN migration_pressure INTEGER NOT NULL DEFAULT 25")
+    if not _col_exists(conn, "eu_state", "disinfo_pressure"):
+        cur.execute("ALTER TABLE eu_state ADD COLUMN disinfo_pressure INTEGER NOT NULL DEFAULT 25")
+    if not _col_exists(conn, "eu_state", "trade_war_pressure"):
+        cur.execute("ALTER TABLE eu_state ADD COLUMN trade_war_pressure INTEGER NOT NULL DEFAULT 25")
+
     # Game meta (round/phase)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS game_meta (
@@ -93,15 +117,34 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     )
     """)
 
+    # External events (USA/China/Russia) per round
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS external_events (
+        round INTEGER NOT NULL,
+        actor TEXT NOT NULL,            -- USA/China/Russia
+        headline TEXT NOT NULL,
+        modifiers_json TEXT NOT NULL,   -- JSON dict with deltas
+        PRIMARY KEY (round, actor)
+    )
+    """)
+
     conn.commit()
 
     # Seed eu_state & game_meta
     cur.execute("SELECT 1 FROM eu_state WHERE id = 1")
     if cur.fetchone() is None:
-        cur.execute("INSERT INTO eu_state (id, cohesion, global_context) VALUES (1, 75, '')")
+        cur.execute("""
+            INSERT INTO eu_state (
+                id, cohesion, global_context,
+                threat_level, frontline_pressure,
+                energy_pressure, migration_pressure, disinfo_pressure, trade_war_pressure
+            )
+            VALUES (1, 75, '', 35, 30, 25, 25, 25, 25)
+        """)
 
     cur.execute("SELECT 1 FROM game_meta WHERE id = 1")
     if cur.fetchone() is None:
+        # phases: setup -> external_generated -> actions_generated -> actions_published
         cur.execute("INSERT INTO game_meta (id, round, phase) VALUES (1, 1, 'setup')")
 
     conn.commit()
@@ -161,17 +204,60 @@ def reset_all_countries(conn: sqlite3.Connection, country_defs: Dict[str, Dict[s
 # -----------------------
 def get_eu_state(conn: sqlite3.Connection) -> Dict[str, Any]:
     cur = conn.cursor()
-    cur.execute("SELECT cohesion, global_context FROM eu_state WHERE id = 1")
-    cohesion, global_context = cur.fetchone()
-    return {"cohesion": int(cohesion), "global_context": str(global_context)}
+    cur.execute("""
+        SELECT cohesion, global_context,
+               threat_level, frontline_pressure,
+               energy_pressure, migration_pressure, disinfo_pressure, trade_war_pressure
+        FROM eu_state WHERE id = 1
+    """)
+    row = cur.fetchone()
+    cohesion, global_context, threat, frontline, energy, migr, disinfo, trade = row
+    return {
+        "cohesion": int(cohesion),
+        "global_context": str(global_context),
+        "threat_level": int(threat),
+        "frontline_pressure": int(frontline),
+        "energy_pressure": int(energy),
+        "migration_pressure": int(migr),
+        "disinfo_pressure": int(disinfo),
+        "trade_war_pressure": int(trade),
+    }
 
 
-def set_eu_state(conn: sqlite3.Connection, cohesion: int, global_context: str) -> None:
+def set_eu_state(
+    conn: sqlite3.Connection,
+    *,
+    cohesion: int,
+    global_context: str,
+    threat_level: int,
+    frontline_pressure: int,
+    energy_pressure: int,
+    migration_pressure: int,
+    disinfo_pressure: int,
+    trade_war_pressure: int,
+) -> None:
     cur = conn.cursor()
-    cur.execute(
-        "UPDATE eu_state SET cohesion = ?, global_context = ? WHERE id = 1",
-        (clamp_int(int(cohesion), 0, 100), str(global_context)),
-    )
+    cur.execute("""
+        UPDATE eu_state SET
+            cohesion = ?,
+            global_context = ?,
+            threat_level = ?,
+            frontline_pressure = ?,
+            energy_pressure = ?,
+            migration_pressure = ?,
+            disinfo_pressure = ?,
+            trade_war_pressure = ?
+        WHERE id = 1
+    """, (
+        clamp_int(int(cohesion), 0, 100),
+        str(global_context),
+        clamp_int(int(threat_level), 0, 100),
+        clamp_int(int(frontline_pressure), 0, 100),
+        clamp_int(int(energy_pressure), 0, 100),
+        clamp_int(int(migration_pressure), 0, 100),
+        clamp_int(int(disinfo_pressure), 0, 100),
+        clamp_int(int(trade_war_pressure), 0, 100),
+    ))
     conn.commit()
 
 
@@ -244,7 +330,6 @@ def apply_country_deltas(conn: sqlite3.Connection, country: str, deltas: Dict[st
     """, (dm, ds, de, dd, dp, country))
     conn.commit()
 
-    # clamp 0..100
     cur.execute("""
         SELECT military, stability, economy, diplomatic_influence, public_approval
         FROM countries WHERE name = ?
@@ -314,9 +399,6 @@ def clear_round_data(conn: sqlite3.Connection, round_no: int) -> None:
 
 
 def upsert_round_actions(conn: sqlite3.Connection, round_no: int, country: str, actions_obj: Dict[str, Any]) -> None:
-    """
-    Save ONLY action_text per variant (public).
-    """
     cur = conn.cursor()
     for variant in ("aggressiv", "moderate", "passiv"):
         text = str(actions_obj[variant]["aktion"])
@@ -329,9 +411,6 @@ def upsert_round_actions(conn: sqlite3.Connection, round_no: int, country: str, 
 
 
 def get_round_actions(conn: sqlite3.Connection, round_no: int) -> Dict[str, Dict[str, str]]:
-    """
-    returns: {country: {variant: action_text}}
-    """
     cur = conn.cursor()
     cur.execute("""
         SELECT country, variant, action_text
@@ -397,3 +476,42 @@ def clear_all_round_summaries(conn: sqlite3.Connection) -> None:
     cur = conn.cursor()
     cur.execute("DELETE FROM round_summaries")
     conn.commit()
+
+
+# -----------------------
+# External events (USA/China/Russia)
+# -----------------------
+def clear_external_events(conn: sqlite3.Connection, round_no: int) -> None:
+    cur = conn.cursor()
+    cur.execute("DELETE FROM external_events WHERE round = ?", (int(round_no),))
+    conn.commit()
+
+
+def upsert_external_event(conn: sqlite3.Connection, round_no: int, actor: str, headline: str, modifiers: Dict[str, Any]) -> None:
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO external_events (round, actor, headline, modifiers_json)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(round, actor) DO UPDATE SET
+            headline = excluded.headline,
+            modifiers_json = excluded.modifiers_json
+    """, (int(round_no), str(actor), str(headline), json.dumps(modifiers, ensure_ascii=False)))
+    conn.commit()
+
+
+def get_external_events(conn: sqlite3.Connection, round_no: int) -> List[Dict[str, Any]]:
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT actor, headline, modifiers_json
+        FROM external_events
+        WHERE round = ?
+        ORDER BY actor ASC
+    """, (int(round_no),))
+    out: List[Dict[str, Any]] = []
+    for actor, headline, mj in cur.fetchall():
+        try:
+            modifiers = json.loads(mj)
+        except Exception:
+            modifiers = {}
+        out.append({"actor": str(actor), "headline": str(headline), "modifiers": modifiers})
+    return out

@@ -81,7 +81,7 @@ COUNTRY_DEFS = {
 EU_DEFAULT = {
     "cohesion": 75,
     "global_context": (
-        "Russland droht mit Gaskürzungen. "
+        "Russland droht mit Gaskürzungen und eskaliert den Krieg in der Ukraine weiter. "
         "USA drohen mit Übernahme Grönlands. "
         "China liebäugelt mit Invasion Taiwans."
     ),
