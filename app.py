@@ -1,7 +1,9 @@
 # app.py
 import os
+import html
+
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -54,6 +56,85 @@ except Exception:
     evaluate_country_win_conditions = None
 
 
+# ----------------------------
+# Streamlit config
+# ----------------------------
+st.set_page_config(page_title="eugenia", layout="wide")
+st.markdown(
+    """
+<style>
+/* Inline tooltip for ℹ️ */
+.eug-tooltip {
+  position: relative;
+  display: inline-block;
+  cursor: help;
+  user-select: none;
+  line-height: 1;
+}
+
+.eug-tooltip .eug-tooltiptext {
+  visibility: hidden;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+  position: absolute;
+  z-index: 99999;
+
+  width: 260px;
+  max-width: 70vw;
+
+  background: rgba(17, 17, 17, 0.95);
+  color: #fff;
+  text-align: left;
+
+  padding: 8px 10px;
+  border-radius: 8px;
+
+  bottom: 130%;
+  left: 50%;
+  transform: translateX(-50%);
+  box-shadow: 0 10px 24px rgba(0,0,0,0.35);
+  font-size: 0.85rem;
+  white-space: normal;
+}
+
+.eug-tooltip:hover .eug-tooltiptext {
+  visibility: visible;
+  opacity: 1;
+}
+
+/* small arrow */
+.eug-tooltip .eug-tooltiptext::after {
+  content: "";
+  position: absolute;
+  top: 100%;
+  left: 50%;
+  margin-left: -6px;
+  border-width: 6px;
+  border-style: solid;
+  border-color: rgba(17, 17, 17, 0.95) transparent transparent transparent;
+}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+st.markdown(
+    """
+<style>
+.eug-kv { margin: 0.15rem 0; }
+.eug-kv-row{
+  display:flex; justify-content:space-between; align-items:baseline;
+  padding: 0.15rem 0;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+.eug-kv-label{ font-size: 0.88rem; opacity: 0.85; }
+.eug-kv-value{ font-size: 0.95rem; font-weight: 600; }
+.eug-kv-sub{ font-size: 0.78rem; opacity: 0.75; margin-top: 0.05rem; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+
 def load_env():
     env_path = Path(__file__).with_name(".env")
     load_dotenv(env_path)
@@ -79,18 +160,6 @@ def pressure_badge(label: str, value: int) -> str:
         icon = "🟢"
         lvl = "niedrig"
     return f"{icon} {label}: {lvl}"
-
-
-def render_metrics(metrics: Dict[str, Any]):
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Wirtschaft", metrics["economy"])
-    c2.metric("Stabilität", metrics["stability"])
-    c3.metric("Militär", metrics["military"])
-    c4, c5 = st.columns(2)
-    c4.metric("Diplomatie", metrics["diplomatic_influence"])
-    c5.metric("Öffentliche Zustimmung", metrics["public_approval"])
-    with st.expander("Ambition"):
-        st.write(metrics["ambition"])
 
 
 def format_external_events(events: List[Dict[str, Any]]) -> str:
@@ -228,6 +297,135 @@ def decay_pressures(eu: Dict[str, Any]) -> Dict[str, Any]:
     out["disinfo_pressure"] = out["disinfo_pressure"] - 3
     out["trade_war_pressure"] = out["trade_war_pressure"] - 3
     return out
+def compact_kv(label: str, value: Any, help_text: str | None = None):
+    # Optional: info-icon rechts neben dem Label
+    label_html = label
+    if help_text:
+        # nutzt deine _info_icon()-Logik NICHT direkt (weil die st.markdown schreibt),
+        # wir bauen das Icon inline als HTML (gleiche tooltip-klasse wie vorher).
+        import html as _html
+        safe = _html.escape(help_text)
+        label_html = f"""{label} <span class="eug-tooltip" style="margin-left:4px;">ℹ️<span class="eug-tooltiptext">{safe}</span></span>"""
+
+    st.markdown(
+        f"""
+<div class="eug-kv">
+  <div class="eug-kv-row">
+    <div class="eug-kv-label">{label_html}</div>
+    <div class="eug-kv-value">{value}</div>
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+# ----------------------------
+# UI: Info tooltips instead of "Werte kurz erklärt"
+# ----------------------------
+VALUE_HELP = {
+    "Wirtschaft": "Wachstum/Inflation/Haushalt. Niedrig → Zustimmung fällt schneller.",
+    "Stabilität": "Regierungsfähigkeit/Protestresistenz. Niedrig → Krisenanfälligkeit.",
+    "Militär": "Abschreckung/Verteidigung. Hilft bei hohem Threat/Frontline, kann innenpolitisch polarisieren.",
+    "Diplomatie": "Fähigkeit zu Deals/Koalitionen/Sanktionen. Hoch → bessere Kompromisse.",
+    "Öffentliche Zustimmung": "Rückendeckung. Niedrig → riskante Entscheidungen “kosten” stärker.",
+    "EU Kohäsion": "Wie geschlossen die EU handelt. Höher = stabilere gemeinsame Linie.",
+    "Threat": "Kriegs-/Eskalationsrisiko gesamt.",
+    "Frontline": "Druck/Spannung an der EU-Ostflanke.",
+    "Energy": "Energie-/Versorgungsdruck (Preise, Engpässe).",
+    "Migration": "Migrationsdruck & innenpolitischer Stress.",
+    "Disinfo": "Desinformation & Polarisierung.",
+    "TradeWar": "Handelskonflikte / wirtschaftlicher Druck von außen.",
+}
+
+
+def _info_icon(help_text: str) -> None:
+        # Escape to avoid breaking HTML
+        safe = html.escape(help_text or "")
+        st.markdown(
+            f"""
+    <span class="eug-tooltip">ℹ️
+    <span class="eug-tooltiptext">{safe}</span>
+    </span>
+    """,
+            unsafe_allow_html=True,
+        )
+
+
+def metric_with_info(label: str, value: Any, help_text: str) -> None:
+    a, b = st.columns([0.86, 0.14])
+    with a:
+        st.metric(label, value)
+    with b:
+        _info_icon(help_text)
+
+
+def render_my_metrics_panel(metrics: Dict[str, Any], country_display_name: str) -> None:
+    st.subheader(f"🏳️ {country_display_name} — Werte")
+
+    compact_kv("Wirtschaft", metrics["economy"], VALUE_HELP["Wirtschaft"])
+    compact_kv("Stabilität", metrics["stability"], VALUE_HELP["Stabilität"])
+    compact_kv("Militär", metrics["military"], VALUE_HELP["Militär"])
+    compact_kv("Diplomatie", metrics["diplomatic_influence"], VALUE_HELP["Diplomatie"])
+    compact_kv("Öffentliche Zustimmung", metrics["public_approval"], VALUE_HELP["Öffentliche Zustimmung"])
+
+    if metrics.get("ambition"):
+        with st.expander("🎯 Ambition", expanded=False):
+            st.write(metrics["ambition"])
+
+
+
+def render_news_panel(
+    conn,
+    *,
+    round_no: int,
+    eu: Dict[str, Any],
+    countries: List[str],
+    countries_display: Dict[str, str],
+    my_country: str,
+) -> None:
+    st.subheader("🗞️ News")
+
+    # Global context (EU-/Weltlage)
+    if eu.get("global_context"):
+        st.info(eu["global_context"])
+
+    # Außenmächte-Moves (öffentlich)
+    ext_events = get_external_events(conn, round_no)
+    if ext_events:
+        with st.expander("🌐 Außenmächte-Moves (öffentlich)", expanded=True):
+            for e in ext_events:
+                st.markdown(f"**{e['actor']}**: {e['headline']}")
+    else:
+        st.caption("Keine Außenmächte-Moves (noch nicht generiert / nicht veröffentlicht).")
+
+    # Aktionen der anderen Spieler aus der letzten Runde (togglebar)
+    with st.expander("🗂️ Letzte Runde — Aktionen der anderen Länder", expanded=False):
+        any_rows = False
+        for c in countries:
+            if c == my_country:
+                continue
+            rows = load_recent_history(conn, c, limit=1)
+            if not rows:
+                continue
+            any_rows = True
+            r = rows[0]
+            st.markdown(f"**{countries_display[c]}** — Runde {r[0]}")
+            st.write(r[1])
+            if r[7]:
+                st.caption(f"Kontext: {r[7]}")
+            st.write("---")
+        if not any_rows:
+            st.caption("Noch keine Historie vorhanden.")
+
+    # Memory / Zusammenfassungen
+    with st.expander("🧠 Letzte Runden (Memory)", expanded=False):
+        mem = get_recent_round_summaries(conn, limit=5)
+        if not mem:
+            st.caption("Noch keine Runden-Summaries vorhanden.")
+        else:
+            for r, s in reversed(mem):
+                st.markdown(f"**Runde {r}**\n\n{s}")
 
 
 def render_player_view(
@@ -244,36 +442,7 @@ def render_player_view(
     action_impacts = get_round_action_impacts(conn, round_no)
     locks_now = get_locks(conn, round_no)
 
-    st.subheader(f"🏳️ Land: {countries_display[my_country]}")
-    my_metrics = load_country_metrics(conn, my_country)
-    if not my_metrics:
-        st.error("Land konnte nicht geladen werden.")
-        return
-
-    render_metrics(my_metrics)
-
-    if evaluate_country_win_conditions is not None:
-        eu_now = get_eu_state(conn)
-        is_winner, cond_results = evaluate_country_win_conditions(
-            my_country,
-            country_metrics=my_metrics,
-            eu_state=eu_now,
-            country_defs=COUNTRY_DEFS,
-        )
-        st.write("---")
-        st.subheader("🏁 Siegfortschritt")
-        if not cond_results:
-            st.warning("Für dieses Land sind noch keine Siegbedingungen definiert (countries.py: win_conditions).")
-        else:
-            if is_winner:
-                st.success("✅ Siegbedingungen erfüllt! Du hast gewonnen.")
-            else:
-                st.info("Noch nicht gewonnen — Bedingungen:")
-            for r in cond_results:
-                st.write(("✅ " if r.ok else "❌ ") + f"{r.label} (aktuell: {r.current})")
-
-    st.write("---")
-
+    # Aktionen (unter News) – nur wenn veröffentlicht
     if phase != "actions_published":
         st.info("Optionen sind noch nicht veröffentlicht. Warte auf den Game Master.")
     else:
@@ -281,7 +450,7 @@ def render_player_view(
         if not a or len(a) < 3:
             st.warning("Optionen fehlen noch (GM muss Aktionen generieren und veröffentlichen).")
         else:
-            st.subheader("Öffentliche Aktion wählen")
+            st.subheader("🎮 Öffentliche Aktion wählen")
 
             if my_country in locks_now:
                 st.success("✅ Eingelockt. (Welche Variante bleibt für andere verborgen.)")
@@ -321,7 +490,8 @@ def render_player_view(
             if is_lock_disabled:
                 st.caption("GM-Hinweis: In der simulierten Spieleransicht ist Einlocken deaktiviert.")
 
-    with st.expander("Turn-History (Mein Land)"):
+    # Eigene Historie bleibt unter Aktionen (togglebar)
+    with st.expander("📜 Turn-History (Mein Land)", expanded=False):
         rows = load_recent_history(conn, my_country, limit=12)
         if not rows:
             st.write("Noch keine Runden gespielt.")
@@ -340,7 +510,10 @@ Kontext: {r[7]}
 # ----------------------------
 # App start
 # ----------------------------
+<<<<<<< HEAD
 st.set_page_config(page_title="eugenia", layout="wide")
+=======
+>>>>>>> ui-rework
 st.title("eugenia - save europe, save yourself")
 
 load_env()
@@ -445,22 +618,6 @@ if not is_gm and not effective_country:
     st.stop()
 
 # ----------------------------
-# Sidebar: Quick guide
-# ----------------------------
-with st.sidebar.expander("📘 Werte erklärt (Kurz)", expanded=False):
-    st.markdown("""
-**Militär**: Abschreckung/Verteidigung. Hilft bei hohem Threat/Frontline, kann innenpolitisch polarisieren.  
-**Stabilität**: Regierungsfähigkeit/Protestresistenz. Niedrig → Krisenanfälligkeit.  
-**Wirtschaft**: Wachstum/Inflation/Haushalt. Niedrig → Zustimmung fällt schneller.  
-**Diplomatie**: Fähigkeit zu Deals/Koalitionen/Sanktionen. Hoch → bessere Kompromisse.  
-**Öffentliche Zustimmung**: Rückendeckung. Niedrig → riskante Entscheidungen “kosten” stärker.
-
-**Druckwerte (EU):**  
-**Threat/Frontline** = Kriegsrisiko & Ostflanken-Spannung.  
-**Energy/Migration/Disinfo/TradeWar** erhöhen innenpolitischen Stress & Spaltung.
-""")
-
-# ----------------------------
 # DB states
 # ----------------------------
 meta = get_game_meta(conn)
@@ -481,6 +638,24 @@ if not eu["global_context"]:
         trade_war_pressure=eu["trade_war_pressure"],
     )
     eu = get_eu_state(conn)
+
+# ----------------------------
+# Sidebar: Rundenstatus (togglebar, statt rechter Spalte)
+# ----------------------------
+with st.sidebar.expander("📊 Rundenstatus", expanded=False):
+    st.write(f"**Runde:** {round_no}  |  **Phase:** {phase}")
+
+    locks = get_locks(conn, round_no)
+    st.write("**Lock-Status (diese Runde)**")
+    for c in countries:
+        name = countries_display[c]
+        if c in locks:
+            if is_gm:
+                st.success(f"{name}: ✅ eingelockt ({locks[c]})")
+            else:
+                st.success(f"{name}: ✅ eingelockt")
+        else:
+            st.warning(f"{name}: ⏳ nicht eingelockt")
 
 # ----------------------------
 # GM: User management
@@ -541,64 +716,69 @@ if is_gm:
         st.rerun()
 
 # ----------------------------
-# Layout
+# Layout: Center + Right
 # ----------------------------
-left, right = st.columns([0.62, 0.38], gap="large")
+center, right = st.columns([0.66, 0.34], gap="large")
+
+panel_country = effective_country if effective_country else assigned_country
 
 # ----------------------------
-# RIGHT: Status + GM controls (GM) / Status (Player)
+# RIGHT: Eigene Werte → EU & Druckwerte → Siegfortschritt
 # ----------------------------
 with right:
-    st.subheader("📊 Rundenstatus")
-    st.write(f"**Runde:** {round_no}  |  **Phase:** {phase}")
+    my_metrics = None
+    if panel_country:
+        my_metrics = load_country_metrics(conn, panel_country)
+        if my_metrics:
+            render_my_metrics_panel(my_metrics, countries_display[panel_country])
+        else:
+            st.warning("Eigene Länderwerte konnten nicht geladen werden.")
+    else:
+        st.info("Kein Land aktiv.")
 
-    locks = get_locks(conn, round_no)
-    st.write("**Lock-Status (diese Runde)**")
-    for c in countries:
-        name = countries_display[c]
-        if c in locks:
-            # GM sieht Variante, Spieler nicht
-            if is_gm:
-                st.success(f"{name}: ✅ eingelockt ({locks[c]})")
+    st.write("---")
+
+    st.subheader("🇪🇺 EU & Druckwerte")
+    metric_with_info("EU Kohäsion", f"{eu['cohesion']}%", VALUE_HELP["EU Kohäsion"])
+
+    compact_kv("Threat", f"{eu['threat_level']}/100", VALUE_HELP["Threat"])
+    compact_kv("Frontline", f"{eu['frontline_pressure']}/100", VALUE_HELP["Frontline"])
+    compact_kv("Energy", f"{eu['energy_pressure']}/100", VALUE_HELP["Energy"])
+    compact_kv("Migration", f"{eu['migration_pressure']}/100", VALUE_HELP["Migration"])
+
+    with st.expander("Mehr Details (Druckwerte)", expanded=False):
+        compact_kv("Disinfo", f"{eu['disinfo_pressure']}/100", VALUE_HELP["Disinfo"])
+        compact_kv("TradeWar", f"{eu['trade_war_pressure']}/100", VALUE_HELP["TradeWar"])
+
+
+    st.write("---")
+
+    st.subheader("🏁 Siegfortschritt")
+    if not panel_country or not my_metrics:
+        st.caption("Siegfortschritt wird angezeigt, sobald ein Land aktiv ist.")
+    elif evaluate_country_win_conditions is None:
+        st.caption("Siegbedingungen-Modul nicht geladen.")
+    else:
+        eu_now = get_eu_state(conn)
+        is_winner, cond_results = evaluate_country_win_conditions(
+            panel_country,
+            country_metrics=my_metrics,
+            eu_state=eu_now,
+            country_defs=COUNTRY_DEFS,
+        )
+        if not cond_results:
+            st.warning("Für dieses Land sind noch keine Siegbedingungen definiert (countries.py: win_conditions).")
+        else:
+            if is_winner:
+                st.success("✅ Siegbedingungen erfüllt! Du hast gewonnen.")
             else:
-                st.success(f"{name}: ✅ eingelockt")
-        else:
-            st.warning(f"{name}: ⏳ nicht eingelockt")
+                st.info("Noch nicht gewonnen — Bedingungen:")
+            for r in cond_results:
+                st.write(("✅ " if r.ok else "❌ ") + f"{r.label} (aktuell: {r.current})")
 
-    st.write("---")
-    st.write("**EU & Druckwerte**")
-    st.write(f"Kohäsion: **{eu['cohesion']}%**")
-    c1, c2 = st.columns(2)
-    c1.write(pressure_badge("Threat", eu["threat_level"]))
-    c1.write(pressure_badge("Frontline", eu["frontline_pressure"]))
-    c2.write(pressure_badge("Energy", eu["energy_pressure"]))
-    c2.write(pressure_badge("Migration", eu["migration_pressure"]))
-    with st.expander("Mehr Details (Druckwerte)"):
-        st.write(f"Disinfo: {eu['disinfo_pressure']} / 100")
-        st.write(f"TradeWar: {eu['trade_war_pressure']} / 100")
-    st.caption(eu["global_context"])
-
-    st.write("---")
-    ext_events = get_external_events(conn, round_no)
-    with st.expander("🌐 Außenmächte-Moves (öffentlich)"):
-        if not ext_events:
-            st.write("Noch keine Moves generiert.")
-        else:
-            for e in ext_events:
-                st.markdown(f"**{e['actor']}**: {e['headline']}")
-
-    st.write("---")
-    with st.expander("🧠 Letzte Runden (Memory)"):
-        mem = get_recent_round_summaries(conn, limit=5)
-        if not mem:
-            st.write("Noch keine Runden-Summaries vorhanden.")
-        else:
-            for r, s in reversed(mem):
-                st.markdown(f"**Runde {r}**\n\n{s}")
-
-    st.write("---")
-
+    # Optional: Winners + GM details (kompakt)
     if evaluate_all_countries is not None:
+        st.write("---")
         all_metrics_now = load_all_country_metrics(conn, countries)
         eu_now = get_eu_state(conn)
         win_eval = evaluate_all_countries(
@@ -612,7 +792,7 @@ with right:
         else:
             st.caption("Noch kein Land hat die Siegbedingungen vollständig erfüllt.")
         if is_gm:
-            with st.expander("📈 Siegfortschritt (GM Detail)"):
+            with st.expander("📈 Siegfortschritt (GM Detail)", expanded=False):
                 for c in countries:
                     st.markdown(f"### {countries_display[c]}")
                     res = win_eval[c]["results"]
@@ -621,209 +801,224 @@ with right:
                         continue
                     for r in res:
                         st.write(("✅ " if r.ok else "❌ ") + f"{r.label} (aktuell: {r.current})")
-        st.write("---")
 
-    # GM controls
+    # GM controls (kompakt in Expander, damit UI clean bleibt)
     if is_gm:
-        st.subheader("🎛️ Game Master Steuerung (sequenziell)")
+        st.write("---")
+        with st.expander("🎛️ Game Master Steuerung (sequenziell)", expanded=False):
+            actions_in_db = get_round_actions(conn, round_no)
+            have_all_actions = all((c in actions_in_db and len(actions_in_db[c]) == 3) for c in countries)
+            have_all_locks = all_locked(conn, round_no, countries)
+            have_external = len(get_external_events(conn, round_no)) == 3
 
-        actions_in_db = get_round_actions(conn, round_no)
-        have_all_actions = all((c in actions_in_db and len(actions_in_db[c]) == 3) for c in countries)
-        have_all_locks = all_locked(conn, round_no, countries)
-        have_external = len(get_external_events(conn, round_no)) == 3
+            # 1) External moves
+            external_disabled = (phase == "actions_published")
+            if st.button(
+                "⚠️ Außenmächte-Züge generieren (USA/China/Russland)",
+                disabled=external_disabled,
+                use_container_width=True,
+            ):
+                with st.spinner("Generiere Außenmächte-Moves..."):
+                    recent_summaries = get_recent_round_summaries(conn, limit=3)
+                    eu_before = get_eu_state(conn)
 
-        # 1) External moves
-        external_disabled = (phase == "actions_published")
-        if st.button("⚠️ Außenmächte-Züge generieren (USA/China/Russland)", disabled=external_disabled, use_container_width=True):
-            with st.spinner("Generiere Außenmächte-Moves..."):
-                recent_summaries = get_recent_round_summaries(conn, limit=3)
-                eu_before = get_eu_state(conn)
-
-                moves_obj = generate_external_moves(
-                    api_key=api_key,
-                    model="mistral-small",
-                    round_no=round_no,
-                    eu_state=eu_before,
-                    recent_round_summaries=recent_summaries,
-                    temperature=0.8,
-                    top_p=0.95,
-                    max_tokens=900,
-                )
-
-                clear_external_events(conn, round_no)
-                for m in moves_obj["moves"]:
-                    upsert_external_event(
-                        conn,
-                        round_no,
-                        actor=m["actor"],
-                        headline=m["headline"],
-                        modifiers=m.get("modifiers", {}),
-                    )
-
-                eu_after = apply_external_modifiers_to_eu(eu_before, moves_obj)
-                set_eu_state(
-                    conn,
-                    cohesion=eu_after["cohesion"],
-                    global_context=eu_after["global_context"],
-                    threat_level=eu_after["threat_level"],
-                    frontline_pressure=eu_after["frontline_pressure"],
-                    energy_pressure=eu_after["energy_pressure"],
-                    migration_pressure=eu_after["migration_pressure"],
-                    disinfo_pressure=eu_after["disinfo_pressure"],
-                    trade_war_pressure=eu_after["trade_war_pressure"],
-                )
-
-                set_game_meta(conn, round_no, "external_generated")
-            st.rerun()
-
-        # 2) Generate actions for all (only after external generated)
-        gen_disabled = not (phase in ("external_generated", "actions_generated") and have_external) or (phase == "actions_published")
-        if st.button("⚙️ Aktionen für alle generieren", disabled=gen_disabled, use_container_width=True):
-            with st.spinner("Generiere Aktionen für alle Länder..."):
-                eu_now = get_eu_state(conn)
-                ext_now = get_external_events(conn, round_no)
-
-                all_metrics = load_all_country_metrics(conn, countries)
-                for c in countries:
-                    m = all_metrics[c]
-                    recent = load_recent_history(conn, c, limit=12)
-
-                    prompt = build_action_prompt(
-                        country_display=countries_display[c],
-                        metrics=m,
-                        eu_state=eu_now,
-                        external_events=ext_now,
-                        recent_actions_summary=summarize_recent_actions(recent),
-                    )
-                    actions_obj, _raw_first, _used_repair = generate_actions_for_country(
+                    moves_obj = generate_external_moves(
                         api_key=api_key,
                         model="mistral-small",
-                        prompt=prompt,
-                        temperature=0.9,
+                        round_no=round_no,
+                        eu_state=eu_before,
+                        recent_round_summaries=recent_summaries,
+                        temperature=0.8,
                         top_p=0.95,
                         max_tokens=900,
                     )
-                    upsert_round_actions(conn, round_no, c, actions_obj)
 
-                set_game_meta(conn, round_no, "actions_generated")
-            st.rerun()
+                    clear_external_events(conn, round_no)
+                    for m in moves_obj["moves"]:
+                        upsert_external_event(
+                            conn,
+                            round_no,
+                            actor=m["actor"],
+                            headline=m["headline"],
+                            modifiers=m.get("modifiers", {}),
+                        )
 
-        actions_in_db = get_round_actions(conn, round_no)
-        if actions_in_db:
-            with st.expander("👀 Vorschau: Generierte Länderaktionen (GM)"):
-                for c in countries:
-                    st.markdown(f"### {countries_display[c]}")
-                    a = actions_in_db.get(c, {})
-                    if not a:
-                        st.caption("Noch keine Aktionen generiert.")
-                        continue
-                    st.write(f"**Aggressiv:** {a.get('aggressiv','')}")
-                    st.write(f"**Moderate:** {a.get('moderate','')}")
-                    st.write(f"**Passiv:** {a.get('passiv','')}")
-                    st.write("---")
-
-        # 3) Publish
-        publish_disabled = not (phase == "actions_generated" and have_all_actions and have_external)
-        if st.button("🚦 Runde starten (Optionen veröffentlichen)", disabled=publish_disabled, use_container_width=True):
-            set_game_meta(conn, round_no, "actions_published")
-            st.rerun()
-
-        # 4) Resolve
-        resolve_disabled = not (phase == "actions_published" and have_all_locks)
-        if st.button("🧮 Ergebnis der Runde kalkulieren", disabled=resolve_disabled, use_container_width=True):
-            with st.spinner("KI kalkuliert Gesamtergebnis der Runde..."):
-                recent_summaries = get_recent_round_summaries(conn, limit=3)
-                eu_before = get_eu_state(conn)
-                ext_now = get_external_events(conn, round_no)
-
-                actions_texts = get_round_actions(conn, round_no)
-                locks_now = get_locks(conn, round_no)
-                all_metrics = load_all_country_metrics(conn, countries)
-
-                chosen_actions_lines = []
-                for c in countries:
-                    v = locks_now[c]
-                    chosen_actions_lines.append(f"- {countries_display[c]} ({c}): {v} -> {actions_texts[c][v]}")
-                chosen_actions_str = "\n".join(chosen_actions_lines)
-
-                result = resolve_round_all_countries(
-                    api_key=api_key,
-                    model="mistral-small",
-                    round_no=round_no,
-                    eu_state=eu_before,
-                    countries_metrics=all_metrics,
-                    countries_display=countries_display,
-                    actions_texts=actions_texts,
-                    locked_choices=locks_now,
-                    recent_round_summaries=recent_summaries,
-                    external_events=ext_now,
-                    temperature=0.6,
-                    top_p=0.95,
-                    max_tokens=1700,
-                )
-
-                eu_after = dict(eu_before)
-                eu_after["cohesion"] = eu_before["cohesion"] + int(result["eu"].get("kohäsion_delta", 0))
-                eu_after["global_context"] = str(result["eu"].get("global_context", eu_before["global_context"]))
-                eu_after = decay_pressures(eu_after)
-
-                set_eu_state(
-                    conn,
-                    cohesion=eu_after["cohesion"],
-                    global_context=eu_after["global_context"],
-                    threat_level=eu_after["threat_level"],
-                    frontline_pressure=eu_after["frontline_pressure"],
-                    energy_pressure=eu_after["energy_pressure"],
-                    migration_pressure=eu_after["migration_pressure"],
-                    disinfo_pressure=eu_after["disinfo_pressure"],
-                    trade_war_pressure=eu_after["trade_war_pressure"],
-                )
-
-                for c in countries:
-                    d = result["länder"][c] or {}
-                    apply_country_deltas(conn, c, d)
-
-                    chosen_variant = locks_now[c]
-                    chosen_action_text = actions_texts[c][chosen_variant]
-                    insert_turn_history(
+                    eu_after = apply_external_modifiers_to_eu(eu_before, moves_obj)
+                    set_eu_state(
                         conn,
-                        country=c,
-                        round_no=round_no,
-                        action_public=chosen_action_text,
+                        cohesion=eu_after["cohesion"],
                         global_context=eu_after["global_context"],
-                        deltas=d,
+                        threat_level=eu_after["threat_level"],
+                        frontline_pressure=eu_after["frontline_pressure"],
+                        energy_pressure=eu_after["energy_pressure"],
+                        migration_pressure=eu_after["migration_pressure"],
+                        disinfo_pressure=eu_after["disinfo_pressure"],
+                        trade_war_pressure=eu_after["trade_war_pressure"],
                     )
 
-                eu_after_fresh = get_eu_state(conn)
-                summary_text = generate_round_summary(
-                    api_key=api_key,
-                    model="mistral-small",
-                    round_no=round_no,
-                    memory_in=recent_summaries,
-                    eu_before=eu_before,
-                    eu_after=eu_after_fresh,
-                    external_events=ext_now,
-                    chosen_actions_str=chosen_actions_str,
-                    result_obj=result,
-                    temperature=0.4,
-                    top_p=0.95,
-                    max_tokens=520,
-                )
-                upsert_round_summary(conn, round_no, summary_text)
+                    set_game_meta(conn, round_no, "external_generated")
+                st.rerun()
 
-                clear_round_data(conn, round_no)
-                clear_external_events(conn, round_no)
-                set_game_meta(conn, round_no + 1, "setup")
+            # 2) Generate actions for all
+            gen_disabled = not (phase in ("external_generated", "actions_generated") and have_external) or (phase == "actions_published")
+            if st.button("⚙️ Aktionen für alle generieren", disabled=gen_disabled, use_container_width=True):
+                with st.spinner("Generiere Aktionen für alle Länder..."):
+                    eu_now = get_eu_state(conn)
+                    ext_now = get_external_events(conn, round_no)
 
-            st.success("Runde aufgelöst, Werte gesetzt, nächste Runde gestartet.")
-            st.rerun()
+                    all_metrics = load_all_country_metrics(conn, countries)
+                    for c in countries:
+                        m = all_metrics[c]
+                        recent = load_recent_history(conn, c, limit=12)
 
-        st.caption("Flow: Außenmächte → Aktionen generieren → Veröffentlichen → Lock → Resolve")
+                        prompt = build_action_prompt(
+                            country_display=countries_display[c],
+                            metrics=m,
+                            eu_state=eu_now,
+                            external_events=ext_now,
+                            recent_actions_summary=summarize_recent_actions(recent),
+                        )
+                        actions_obj, _raw_first, _used_repair = generate_actions_for_country(
+                            api_key=api_key,
+                            model="mistral-small",
+                            prompt=prompt,
+                            temperature=0.9,
+                            top_p=0.95,
+                            max_tokens=900,
+                        )
+                        upsert_round_actions(conn, round_no, c, actions_obj)
+
+                    set_game_meta(conn, round_no, "actions_generated")
+                st.rerun()
+
+            actions_in_db = get_round_actions(conn, round_no)
+            if actions_in_db:
+                with st.expander("👀 Vorschau: Generierte Länderaktionen (GM)", expanded=False):
+                    for c in countries:
+                        st.markdown(f"### {countries_display[c]}")
+                        a = actions_in_db.get(c, {})
+                        if not a:
+                            st.caption("Noch keine Aktionen generiert.")
+                            continue
+                        st.write(f"**Aggressiv:** {a.get('aggressiv','')}")
+                        st.write(f"**Moderate:** {a.get('moderate','')}")
+                        st.write(f"**Passiv:** {a.get('passiv','')}")
+                        st.write("---")
+
+            # 3) Publish
+            publish_disabled = not (phase == "actions_generated" and have_all_actions and have_external)
+            if st.button("🚦 Runde starten (Optionen veröffentlichen)", disabled=publish_disabled, use_container_width=True):
+                set_game_meta(conn, round_no, "actions_published")
+                st.rerun()
+
+            # 4) Resolve
+            resolve_disabled = not (phase == "actions_published" and have_all_locks)
+            if st.button("🧮 Ergebnis der Runde kalkulieren", disabled=resolve_disabled, use_container_width=True):
+                with st.spinner("KI kalkuliert Gesamtergebnis der Runde..."):
+                    recent_summaries = get_recent_round_summaries(conn, limit=3)
+                    eu_before = get_eu_state(conn)
+                    ext_now = get_external_events(conn, round_no)
+
+                    actions_texts = get_round_actions(conn, round_no)
+                    locks_now = get_locks(conn, round_no)
+                    all_metrics = load_all_country_metrics(conn, countries)
+
+                    chosen_actions_lines = []
+                    for c in countries:
+                        v = locks_now[c]
+                        chosen_actions_lines.append(f"- {countries_display[c]} ({c}): {v} -> {actions_texts[c][v]}")
+                    chosen_actions_str = "\n".join(chosen_actions_lines)
+
+                    result = resolve_round_all_countries(
+                        api_key=api_key,
+                        model="mistral-small",
+                        round_no=round_no,
+                        eu_state=eu_before,
+                        countries_metrics=all_metrics,
+                        countries_display=countries_display,
+                        actions_texts=actions_texts,
+                        locked_choices=locks_now,
+                        recent_round_summaries=recent_summaries,
+                        external_events=ext_now,
+                        temperature=0.6,
+                        top_p=0.95,
+                        max_tokens=1700,
+                    )
+
+                    eu_after = dict(eu_before)
+                    eu_after["cohesion"] = eu_before["cohesion"] + int(result["eu"].get("kohäsion_delta", 0))
+                    eu_after["global_context"] = str(result["eu"].get("global_context", eu_before["global_context"]))
+                    eu_after = decay_pressures(eu_after)
+
+                    set_eu_state(
+                        conn,
+                        cohesion=eu_after["cohesion"],
+                        global_context=eu_after["global_context"],
+                        threat_level=eu_after["threat_level"],
+                        frontline_pressure=eu_after["frontline_pressure"],
+                        energy_pressure=eu_after["energy_pressure"],
+                        migration_pressure=eu_after["migration_pressure"],
+                        disinfo_pressure=eu_after["disinfo_pressure"],
+                        trade_war_pressure=eu_after["trade_war_pressure"],
+                    )
+
+                    for c in countries:
+                        d = result["länder"][c] or {}
+                        apply_country_deltas(conn, c, d)
+
+                        chosen_variant = locks_now[c]
+                        chosen_action_text = actions_texts[c][chosen_variant]
+                        insert_turn_history(
+                            conn,
+                            country=c,
+                            round_no=round_no,
+                            action_public=chosen_action_text,
+                            global_context=eu_after["global_context"],
+                            deltas=d,
+                        )
+
+                    eu_after_fresh = get_eu_state(conn)
+                    summary_text = generate_round_summary(
+                        api_key=api_key,
+                        model="mistral-small",
+                        round_no=round_no,
+                        memory_in=recent_summaries,
+                        eu_before=eu_before,
+                        eu_after=eu_after_fresh,
+                        external_events=ext_now,
+                        chosen_actions_str=chosen_actions_str,
+                        result_obj=result,
+                        temperature=0.4,
+                        top_p=0.95,
+                        max_tokens=520,
+                    )
+                    upsert_round_summary(conn, round_no, summary_text)
+
+                    clear_round_data(conn, round_no)
+                    clear_external_events(conn, round_no)
+                    set_game_meta(conn, round_no + 1, "setup")
+
+                st.success("Runde aufgelöst, Werte gesetzt, nächste Runde gestartet.")
+                st.rerun()
+
+            st.caption("Flow: Außenmächte → Aktionen generieren → Veröffentlichen → Lock → Resolve")
 
 # ----------------------------
-# LEFT: Player UI (Players always; GM only if simulating)
+# CENTER: News oben, darunter Aktionen
 # ----------------------------
-with left:
+with center:
+    if panel_country:
+        render_news_panel(
+            conn,
+            round_no=round_no,
+            eu=eu,
+            countries=countries,
+            countries_display=countries_display,
+            my_country=panel_country,
+        )
+        st.write("---")
+
+    # Aktionen unter News
     if is_gm:
         st.subheader("🎮 Spieleransicht (GM Simulation)")
         if not is_simulating_player_view or not effective_country:
@@ -836,10 +1031,10 @@ with left:
                 eu=eu,
                 countries_display=countries_display,
                 my_country=effective_country,
-                is_lock_disabled=False,  # GM can lock in simulation
+                is_lock_disabled=False,
             )
     else:
-        st.subheader("🎮 Spielerbereich")
+        st.subheader("🎮 Aktionen")
         render_player_view(
             conn=conn,
             round_no=round_no,
