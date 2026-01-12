@@ -340,8 +340,8 @@ Kontext: {r[7]}
 # ----------------------------
 # App start
 # ----------------------------
-st.set_page_config(page_title="EU Geopolitik (Login + GM + Außenmächte)", layout="wide")
-st.title("EU Geopolitik — Login + Game Master + USA/China/Russland")
+st.set_page_config(page_title="eugenia", layout="wide")
+st.title("eugenia - save europe, save yourself")
 
 load_env()
 
