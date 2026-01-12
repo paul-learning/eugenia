@@ -117,6 +117,22 @@ st.markdown(
 """,
     unsafe_allow_html=True,
 )
+st.markdown(
+    """
+<style>
+.eug-kv { margin: 0.15rem 0; }
+.eug-kv-row{
+  display:flex; justify-content:space-between; align-items:baseline;
+  padding: 0.15rem 0;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+.eug-kv-label{ font-size: 0.88rem; opacity: 0.85; }
+.eug-kv-value{ font-size: 0.95rem; font-weight: 600; }
+.eug-kv-sub{ font-size: 0.78rem; opacity: 0.75; margin-top: 0.05rem; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
 
 def load_env():
@@ -281,6 +297,27 @@ def decay_pressures(eu: Dict[str, Any]) -> Dict[str, Any]:
     out["disinfo_pressure"] = out["disinfo_pressure"] - 3
     out["trade_war_pressure"] = out["trade_war_pressure"] - 3
     return out
+def compact_kv(label: str, value: Any, help_text: str | None = None):
+    # Optional: info-icon rechts neben dem Label
+    label_html = label
+    if help_text:
+        # nutzt deine _info_icon()-Logik NICHT direkt (weil die st.markdown schreibt),
+        # wir bauen das Icon inline als HTML (gleiche tooltip-klasse wie vorher).
+        import html as _html
+        safe = _html.escape(help_text)
+        label_html = f"""{label} <span class="eug-tooltip" style="margin-left:4px;">ℹ️<span class="eug-tooltiptext">{safe}</span></span>"""
+
+    st.markdown(
+        f"""
+<div class="eug-kv">
+  <div class="eug-kv-row">
+    <div class="eug-kv-label">{label_html}</div>
+    <div class="eug-kv-value">{value}</div>
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
 
 
 # ----------------------------
@@ -326,23 +363,16 @@ def metric_with_info(label: str, value: Any, help_text: str) -> None:
 def render_my_metrics_panel(metrics: Dict[str, Any], country_display_name: str) -> None:
     st.subheader(f"🏳️ {country_display_name} — Werte")
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        metric_with_info("Wirtschaft", metrics["economy"], VALUE_HELP["Wirtschaft"])
-    with c2:
-        metric_with_info("Stabilität", metrics["stability"], VALUE_HELP["Stabilität"])
-    with c3:
-        metric_with_info("Militär", metrics["military"], VALUE_HELP["Militär"])
-
-    c4, c5 = st.columns(2)
-    with c4:
-        metric_with_info("Diplomatie", metrics["diplomatic_influence"], VALUE_HELP["Diplomatie"])
-    with c5:
-        metric_with_info("Öffentliche Zustimmung", metrics["public_approval"], VALUE_HELP["Öffentliche Zustimmung"])
+    compact_kv("Wirtschaft", metrics["economy"], VALUE_HELP["Wirtschaft"])
+    compact_kv("Stabilität", metrics["stability"], VALUE_HELP["Stabilität"])
+    compact_kv("Militär", metrics["military"], VALUE_HELP["Militär"])
+    compact_kv("Diplomatie", metrics["diplomatic_influence"], VALUE_HELP["Diplomatie"])
+    compact_kv("Öffentliche Zustimmung", metrics["public_approval"], VALUE_HELP["Öffentliche Zustimmung"])
 
     if metrics.get("ambition"):
         with st.expander("🎯 Ambition", expanded=False):
             st.write(metrics["ambition"])
+
 
 
 def render_news_panel(
@@ -707,23 +737,15 @@ with right:
     st.subheader("🇪🇺 EU & Druckwerte")
     metric_with_info("EU Kohäsion", f"{eu['cohesion']}%", VALUE_HELP["EU Kohäsion"])
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.write(pressure_badge("Threat", eu["threat_level"]))
-        _info_icon(VALUE_HELP["Threat"])
-        st.write(pressure_badge("Frontline", eu["frontline_pressure"]))
-        _info_icon(VALUE_HELP["Frontline"])
-    with c2:
-        st.write(pressure_badge("Energy", eu["energy_pressure"]))
-        _info_icon(VALUE_HELP["Energy"])
-        st.write(pressure_badge("Migration", eu["migration_pressure"]))
-        _info_icon(VALUE_HELP["Migration"])
+    compact_kv("Threat", f"{eu['threat_level']}/100", VALUE_HELP["Threat"])
+    compact_kv("Frontline", f"{eu['frontline_pressure']}/100", VALUE_HELP["Frontline"])
+    compact_kv("Energy", f"{eu['energy_pressure']}/100", VALUE_HELP["Energy"])
+    compact_kv("Migration", f"{eu['migration_pressure']}/100", VALUE_HELP["Migration"])
 
     with st.expander("Mehr Details (Druckwerte)", expanded=False):
-        st.write(f"Disinfo: {eu['disinfo_pressure']} / 100")
-        _info_icon(VALUE_HELP["Disinfo"])
-        st.write(f"TradeWar: {eu['trade_war_pressure']} / 100")
-        _info_icon(VALUE_HELP["TradeWar"])
+        compact_kv("Disinfo", f"{eu['disinfo_pressure']}/100", VALUE_HELP["Disinfo"])
+        compact_kv("TradeWar", f"{eu['trade_war_pressure']}/100", VALUE_HELP["TradeWar"])
+
 
     st.write("---")
 
