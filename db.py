@@ -140,6 +140,12 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     )
     """)
 
+    # --- NEW migrations: quote + craziness for external events ---
+    if not _col_exists(conn, "external_events", "quote"):
+        cur.execute("ALTER TABLE external_events ADD COLUMN quote TEXT NOT NULL DEFAULT ''")
+    if not _col_exists(conn, "external_events", "craziness"):
+        cur.execute("ALTER TABLE external_events ADD COLUMN craziness INTEGER NOT NULL DEFAULT 0")
+
     # Users (auth)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users (
@@ -652,33 +658,57 @@ def clear_external_events(conn: sqlite3.Connection, round_no: int) -> None:
     conn.commit()
 
 
-def upsert_external_event(conn: sqlite3.Connection, round_no: int, actor: str, headline: str, modifiers: Dict[str, Any]) -> None:
+def upsert_external_event(
+    conn: sqlite3.Connection,
+    round_no: int,
+    actor: str,
+    headline: str,
+    modifiers: Dict[str, Any],
+    *,
+    quote: str = "",
+    craziness: int = 0,
+) -> None:
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO external_events (round, actor, headline, modifiers_json)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO external_events (round, actor, headline, modifiers_json, quote, craziness)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(round, actor) DO UPDATE SET
             headline = excluded.headline,
-            modifiers_json = excluded.modifiers_json
-    """, (int(round_no), str(actor), str(headline), json.dumps(modifiers, ensure_ascii=False)))
+            modifiers_json = excluded.modifiers_json,
+            quote = excluded.quote,
+            craziness = excluded.craziness
+    """, (
+        int(round_no),
+        str(actor),
+        str(headline),
+        json.dumps(modifiers, ensure_ascii=False),
+        str(quote),
+        int(craziness),
+    ))
     conn.commit()
 
 
 def get_external_events(conn: sqlite3.Connection, round_no: int) -> List[Dict[str, Any]]:
     cur = conn.cursor()
     cur.execute("""
-        SELECT actor, headline, modifiers_json
+        SELECT actor, headline, modifiers_json, quote, craziness
         FROM external_events
         WHERE round = ?
         ORDER BY actor ASC
     """, (int(round_no),))
     out: List[Dict[str, Any]] = []
-    for actor, headline, mj in cur.fetchall():
+    for actor, headline, mj, quote, craziness in cur.fetchall():
         try:
             modifiers = json.loads(mj)
         except Exception:
             modifiers = {}
-        out.append({"actor": str(actor), "headline": str(headline), "modifiers": modifiers})
+        out.append({
+            "actor": str(actor),
+            "headline": str(headline),
+            "modifiers": modifiers,
+            "quote": str(quote or ""),
+            "craziness": int(craziness or 0),
+        })
     return out
 
 
@@ -759,11 +789,15 @@ def delete_user(conn: sqlite3.Connection, username: str) -> None:
     cur = conn.cursor()
     cur.execute("DELETE FROM users WHERE username=?", (username.strip(),))
     conn.commit()
+
+
 def get_max_snapshot_round(conn: sqlite3.Connection) -> Optional[int]:
     cur = conn.cursor()
     cur.execute("SELECT MAX(round) FROM country_snapshots")
     r = cur.fetchone()[0]
     return int(r) if r is not None else None
+
+
 def clear_country_snapshots(conn: sqlite3.Connection) -> None:
     cur = conn.cursor()
     cur.execute("DELETE FROM country_snapshots")

@@ -86,3 +86,30 @@ EU_DEFAULT = {
         "China liebäugelt mit Invasion Taiwans."
     ),
 }
+
+# ----------------------------
+# NEW: Außenmächte-Flavor (Crazy + Quote / Soundbite)
+# ----------------------------
+
+# Hinweis: Das sind "Stil-Rollen" fürs Spiel (fiktive Soundbites), keine echten Zitate.
+EXTERNAL_LEADER_STYLE = {
+    "USA": {
+        "leader_label": "US-Präsident (Trump-ähnlicher Ton)",
+        "style": "kurz, markig, superlativ-lastig, deal-orientiert, 'wir gewinnen' vibe",
+    },
+    "Russia": {
+        "leader_label": "Kremlchef (Putin-ähnlicher Ton)",
+        "style": "kalt, kontrolliert, drohend mit Unterton, spricht von 'roten Linien' und 'Souveränität'",
+    },
+    "China": {
+        "leader_label": "Staatspräsident (Xi-ähnlicher Ton)",
+        "style": "bürokratisch-höflich, aber unmissverständlich, spricht von 'Stabilität', 'Harmonie', 'Souveränität'",
+    },
+}
+
+# Baseline-Tendenzen (du kannst die ranges jederzeit tweaken)
+EXTERNAL_CRAZY_BASELINE_RANGES = {
+    "USA": (30, 90),
+    "Russia": (20, 85),
+    "China": (15, 80),
+}

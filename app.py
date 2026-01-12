@@ -1,15 +1,17 @@
 import os
 import html
+import random
 from pathlib import Path
 from typing import Dict, Any, List
-from streamlit_autorefresh import st_autorefresh
-from db import clear_country_snapshots
-
 
 import streamlit as st
 from dotenv import load_dotenv
 
-from countries import COUNTRY_DEFS, EU_DEFAULT
+from countries import (
+    COUNTRY_DEFS,
+    EU_DEFAULT,
+    EXTERNAL_CRAZY_BASELINE_RANGES,
+)
 
 from db import (
     get_conn,
@@ -40,6 +42,7 @@ from db import (
     # snapshots/dashboard
     upsert_country_snapshot,
     get_country_snapshots,
+    clear_country_snapshots,
     # external
     clear_external_events,
     upsert_external_event,
@@ -162,7 +165,12 @@ def format_external_events(events: List[Dict[str, Any]]) -> str:
         return "Keine."
     lines = []
     for e in events:
-        lines.append(f"- {e.get('actor')}: {e.get('headline')}")
+        c = int(e.get("craziness", 0) or 0)
+        q = (e.get("quote") or "").strip()
+        if q:
+            lines.append(f"- {e.get('actor')} (crazy={c}/100): {e.get('headline')} — {q}")
+        else:
+            lines.append(f"- {e.get('actor')} (crazy={c}/100): {e.get('headline')}")
     return "\n".join(lines)
 
 
@@ -362,7 +370,6 @@ def render_my_metrics_panel(metrics: Dict[str, Any], country_display_name: str) 
 
 
 def _progress_from_conditions(cond_results) -> float:
-    # cond_results ist eine Liste von Objekten mit .ok (aus win.py). Robust fallback:
     try:
         total = len(cond_results)
         if total <= 0:
@@ -387,39 +394,85 @@ def render_news_panel(
     if eu.get("global_context"):
         st.info(eu["global_context"])
 
-    ext_events = get_external_events(conn, round_no)
-    if ext_events:
-        with st.expander("🌐 Außenmächte-Moves (öffentlich)", expanded=True):
-            for e in ext_events:
-                st.markdown(f"**{e['actor']}**: {e['headline']}")
+    # --- Aktuelle Runde: Außenmächte (wie bisher) ---
+    ext_events_now = get_external_events(conn, round_no)
+    if ext_events_now:
+        with st.expander("🌐 Außenmächte-Moves (aktuelle Runde)", expanded=True):
+            for e in ext_events_now:
+                c = int(e.get("craziness", 0) or 0)
+                st.markdown(f"**{e['actor']}** (🎲 {c}/100): {e['headline']}")
+                q = (e.get("quote") or "").strip()
+                if q and q != "—":
+                    st.caption(f"🗣️ {q}")
     else:
-        st.caption("Keine Außenmächte-Moves (noch nicht generiert / nicht veröffentlicht).")
+        st.caption("Keine Außenmächte-Moves (noch nicht generiert).")
 
-    with st.expander("🗂️ Letzte Runde — Aktionen der anderen Länder", expanded=False):
-        any_rows = False
-        for c in countries:
-            if c == my_country:
-                continue
-            rows = load_recent_history(conn, c, limit=1)
-            if not rows:
-                continue
-            any_rows = True
-            r = rows[0]
-            st.markdown(f"**{countries_display[c]}** — Runde {r[0]}")
-            st.write(r[1])
-            if r[7]:
-                st.caption(f"Kontext: {r[7]}")
-            st.write("---")
-        if not any_rows:
+    # --- NEU: Runden-Historie (Außenmächte + Länderaktionen) ---
+    with st.expander("🕰️ Runden-Historie (Außenmächte + Aktionen)", expanded=False):
+        # Welche Runden existieren? (aus turn_history UND external_events)
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT round FROM turn_history ORDER BY round DESC")
+        rounds_from_turns = [int(r[0]) for r in cur.fetchall()]
+
+        cur.execute("SELECT DISTINCT round FROM external_events ORDER BY round DESC")
+        rounds_from_external = [int(r[0]) for r in cur.fetchall()]
+
+        all_rounds = sorted(set(rounds_from_turns + rounds_from_external), reverse=True)
+
+        if not all_rounds:
             st.caption("Noch keine Historie vorhanden.")
-
-    with st.expander("🧠 Letzte Runden (Memory)", expanded=False):
-        mem = get_recent_round_summaries(conn, limit=5)
-        if not mem:
-            st.caption("Noch keine Runden-Summaries vorhanden.")
         else:
-            for r, s in reversed(mem):
-                st.markdown(f"**Runde {r}**\n\n{s}")
+            # Optional: kompakt zuerst die neueste Runde anzeigen
+            for r in all_rounds:
+                with st.expander(f"Runde {r}", expanded=(r == all_rounds[0])):
+                    # 1) Außenmächte dieser Runde
+                    ext_events_r = get_external_events(conn, r)
+                    if ext_events_r:
+                        st.markdown("**🌐 Außenmächte**")
+                        for e in ext_events_r:
+                            c = int(e.get("craziness", 0) or 0)
+                            st.markdown(f"- **{e['actor']}** (🎲 {c}/100): {e['headline']}")
+                            q = (e.get("quote") or "").strip()
+                            if q and q != "—":
+                                st.caption(f"🗣️ {q}")
+                    else:
+                        st.caption("Keine Außenmächte-Moves für diese Runde.")
+
+                    st.write("---")
+
+                    # 2) Aktionen der Länder dieser Runde (aus turn_history)
+                    st.markdown("**🏛️ Länderaktionen**")
+                    cur.execute(
+                        """
+                        SELECT country, action_public, global_context
+                        FROM turn_history
+                        WHERE round = ?
+                        ORDER BY country ASC
+                        """,
+                        (int(r),),
+                    )
+                    rows = cur.fetchall()
+                    if not rows:
+                        st.caption("Keine Länderaktionen gespeichert (evtl. Runde noch nicht resolved).")
+                    else:
+                        for country, action_public, global_context in rows:
+                            name = countries_display.get(country, country)
+                            st.markdown(f"**{name}**")
+                            st.write(action_public)
+                            if global_context:
+                                st.caption(f"Kontext: {global_context}")
+
+    # --- (Optional) Deine alte "Letzte Runde — Aktionen anderer Länder" Sektion kannst du entfernen,
+    #     weil die Historie das jetzt besser abdeckt.
+    #     Wenn du sie behalten willst: ergänze hier nur die Außenmächte der letzten Runde, aber ist redundant. ---
+
+    #with st.expander("🧠 Letzte Runden (Memory)", expanded=False):
+    #    mem = get_recent_round_summaries(conn, limit=5)
+    #    if not mem:
+    #        st.caption("Noch keine Runden-Summaries vorhanden.")
+    #    else:
+    #for r, s in reversed(mem):
+    #            st.markdown(f"**Runde {r}**\n\n{s}")
 
 
 def render_public_dashboard(conn, *, countries: List[str], countries_display: Dict[str, str]):
@@ -430,7 +483,6 @@ def render_public_dashboard(conn, *, countries: List[str], countries_display: Di
         st.caption("Noch keine Daten: Dashboard füllt sich nach dem ersten Resolve (Runde 1).")
         return
 
-    # Leaderboard = letzte Runde pro Land
     latest_by_country: Dict[str, Dict[str, Any]] = {}
     for row in snapshots:
         c = row["country"]
@@ -439,22 +491,26 @@ def render_public_dashboard(conn, *, countries: List[str], countries_display: Di
 
     leaderboard = sorted(latest_by_country.values(), key=lambda x: (x["victory_progress"], x["public_approval"]), reverse=True)
 
-    cols = st.columns([0.35, 0.18, 0.16, 0.16, 0.15])
+    cols = st.columns([0.26, 0.14, 0.12, 0.12, 0.12, 0.12, 0.12])
     cols[0].markdown("**Land**")
     cols[1].markdown("**Sieg %**")
     cols[2].markdown("**Approval**")
     cols[3].markdown("**Stabilität**")
     cols[4].markdown("**Wirtschaft**")
+    cols[5].markdown("**Militär**")
+    cols[6].markdown("**Diplomatie**")
 
     for r in leaderboard:
         name = countries_display.get(r["country"], r["country"])
         badge = "🏆 " if r["is_winner"] else ""
-        cols = st.columns([0.35, 0.18, 0.16, 0.16, 0.15])
+        cols = st.columns([0.26, 0.14, 0.12, 0.12, 0.12, 0.12, 0.12])
         cols[0].write(f"{badge}{name}")
         cols[1].write(f"{r['victory_progress']:.0f}%")
         cols[2].write(r["public_approval"])
         cols[3].write(r["stability"])
         cols[4].write(r["economy"])
+        cols[5].write(r["military"])
+        cols[6].write(r["diplomatic_influence"])
 
     st.write("---")
 
@@ -513,12 +569,11 @@ def render_player_view(
         st.success("✅ Eingelockt. (Welche Variante bleibt für andere verborgen.)")
     else:
         st.warning("⏳ Noch nicht eingelockt.")
-    #auto refresh
-    # Beispiel: Auto-refresh nur wenn nichts zu tun ist
-    is_waiting = (phase != "actions_published") or (phase == "actions_published" and my_country in get_locks(conn, round_no))
 
-    if not is_gm and is_waiting and phase != "game_over":
-        st_autorefresh(interval=4000, key="player_wait_refresh")  # 4s
+    # Auto-refresh (built-in Streamlit)
+    is_waiting = (phase != "actions_published") or (phase == "actions_published" and my_country in get_locks(conn, round_no))
+    if (not is_gm) and is_waiting and phase != "game_over":
+        st.autorefresh(interval=4000, key="player_wait_refresh")
 
     options = {
         "aggressiv": a["aggressiv"],
@@ -864,7 +919,6 @@ with center:
 
     st.write("---")
 
-    # Aktionen unter Dashboard/News
     if is_gm:
         st.subheader("🎮 Spieleransicht (GM Simulation)")
         if not is_simulating_player_view or not effective_country:
@@ -892,9 +946,8 @@ with center:
         )
 
 # ----------------------------
-# GM controls (kompakt in Sidebar-ähnlichem Bereich rechts? -> bleibt rechts oben)
+# GM controls
 # ----------------------------
-# GM controls bleiben in RIGHT-Spalte als Expander (wie vorher), aber wir hängen sie unten an:
 with right:
     if is_gm:
         st.write("---")
@@ -919,18 +972,31 @@ with right:
                     recent_summaries = get_recent_round_summaries(conn, limit=3)
                     eu_before = get_eu_state(conn)
 
+                    # --- NEW: Crazy pro Runde würfeln (mit Baselines) ---
+                    usa_min, usa_max = EXTERNAL_CRAZY_BASELINE_RANGES["USA"]
+                    rus_min, rus_max = EXTERNAL_CRAZY_BASELINE_RANGES["Russia"]
+                    chi_min, chi_max = EXTERNAL_CRAZY_BASELINE_RANGES["China"]
+
+                    craziness_by_actor = {
+                        "USA": random.randint(usa_min, usa_max),
+                        "Russia": random.randint(rus_min, rus_max),
+                        "China": random.randint(chi_min, chi_max),
+                    }
+
                     moves_obj = generate_external_moves(
                         api_key=api_key,
                         model="mistral-small",
                         round_no=round_no,
                         eu_state=eu_before,
                         recent_round_summaries=recent_summaries,
+                        craziness_by_actor=craziness_by_actor,
                         temperature=0.8,
                         top_p=0.95,
-                        max_tokens=900,
+                        max_tokens=1200,
                     )
 
                     clear_external_events(conn, round_no)
+
                     for m in moves_obj["moves"]:
                         upsert_external_event(
                             conn,
@@ -938,6 +1004,8 @@ with right:
                             actor=m["actor"],
                             headline=m["headline"],
                             modifiers=m.get("modifiers", {}),
+                            quote=m.get("quote", ""),
+                            craziness=int(m.get("craziness", 0) or 0),
                         )
 
                     eu_after = apply_external_modifiers_to_eu(eu_before, moves_obj)
@@ -1046,7 +1114,7 @@ with right:
                     )
                     all_metrics_before = load_all_country_metrics(conn, countries)
                     eu_before_for_progress = get_eu_state(conn)
-                    # --- Baseline snapshots (round_no-1) nur wenn noch nicht vorhanden ---
+
                     max_snap = get_max_snapshot_round(conn)
                     need_baseline = (max_snap is None) and (round_no >= 1)
 
@@ -1079,7 +1147,6 @@ with right:
                                     is_winner=False,
                                 )
 
-                    # Apply deltas + history
                     for c in countries:
                         d = result["länder"][c] or {}
                         apply_country_deltas(conn, c, d)
@@ -1097,7 +1164,6 @@ with right:
 
                     eu_after_fresh = get_eu_state(conn)
 
-                    # Summary
                     summary_text = generate_round_summary(
                         api_key=api_key,
                         model="mistral-small",
@@ -1114,7 +1180,6 @@ with right:
                     )
                     upsert_round_summary(conn, round_no, summary_text)
 
-                    # Snapshots + GameOver check
                     winners: List[str] = []
                     all_metrics_now = load_all_country_metrics(conn, countries)
                     eu_now = get_eu_state(conn)
@@ -1127,7 +1192,7 @@ with right:
                         )
                         for c in countries:
                             res = win_eval.get(c, {})
-                            is_winner = bool(res.get("is_winner"))
+                            is_winner_now = bool(res.get("is_winner"))
                             progress = _progress_from_conditions(res.get("results") or [])
                             upsert_country_snapshot(
                                 conn,
@@ -1135,12 +1200,11 @@ with right:
                                 country=c,
                                 metrics=all_metrics_now[c],
                                 victory_progress=progress,
-                                is_winner=is_winner,
+                                is_winner=is_winner_now,
                             )
-                            if is_winner:
+                            if is_winner_now:
                                 winners.append(c)
                     else:
-                        # fallback: nur Werte snapshotten ohne progress
                         for c in countries:
                             upsert_country_snapshot(
                                 conn,
@@ -1151,14 +1215,11 @@ with right:
                                 is_winner=False,
                             )
 
-                    # Finish round: Game Over or next round
                     clear_round_data(conn, round_no)
-                    clear_external_events(conn, round_no)
+                    # clear_external_events(conn, round_no)
 
                     if winners:
-                        # falls mehrere, nimm den ersten (oder du machst später Co-Winner)
                         set_game_over(conn, winner_country=winners[0], winner_round=round_no, reason="win_conditions")
-                        # Wichtig: round bleibt auf aktueller Runde (Endzustand)
                     else:
                         set_game_meta(conn, round_no + 1, "setup")
 
