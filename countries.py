@@ -73,7 +73,7 @@ COUNTRY_DEFS = {
             {"metric": "public_approval", "op": ">=", "value": 80, "label": "Sehr hohe öffentliche Zustimmung (≥ 80)"},
             {"metric": "stability", "op": ">=", "value": 75, "label": "Starke innenpolitische Kontrolle (≥ 75)"},
             {"metric": "economy", "op": ">=", "value": 65, "label": "Ausreichende wirtschaftliche Lage (≥ 65)"},
-            {"metric": "eu_cohesion", "op": "<=", "value": 65, "label": "Begrenzter EU-Zusammenhalt (≤ 65)"},
+            {"metric": "eu_cohesion", "op": "<=", "value": 45, "label": "Begrenzter EU-Zusammenhalt (≤ 45)"},
         ],
     },
 }
