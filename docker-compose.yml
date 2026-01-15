@@ -1,0 +1,16 @@
+services:
+  yourope:
+    build: .
+    container_name: yourope
+    restart: unless-stopped
+    env_file:
+      - .env
+    networks:
+      - caddy_net
+
+networks:
+  caddy_net:
+    external: true
+    # IMPORTANT: set this to the network your Caddy container is connected to.
+    # Run: docker inspect retro-tool-caddy-1 --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}'
+    name: retro-tool_default
